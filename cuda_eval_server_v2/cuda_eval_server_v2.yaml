@@ -1,0 +1,287 @@
+# CUDA Evaluation Server V2 - Kubernetes Deployment
+# Optimized for AWS EC2 GPU instances: p5.48xlarge, p5e.48xlarge, p4d.24xlarge
+# 
+# Key Features:
+# - Multi-kernel type support (TORCH, TORCH_CUDA, TRITON)
+# - Subprocess isolation for crash safety
+# - NCU profiling capabilities
+# - CUDA 12.4 with cuDNN support
+# - Async request handling with FastAPI
+#
+# Instance Specifications:
+# - p5.48xlarge: 8x H100 GPUs, 192 vCPUs, 2048 GiB memory, 8x 3.84 TB NVMe SSD
+# - p5e.48xlarge: 8x H200 GPUs, 192 vCPUs, 2048 GiB memory
+# - p4d.24xlarge: 8x A100 GPUs, 96 vCPUs, 1152 GiB memory, 8x 1.9 TB NVMe SSD
+
+# Deployment manages a set of identical pods (replicas)
+# It ensures the desired number of pods are running and handles updates
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cuda-eval-server
+  labels:
+    app: cuda-eval-server
+    version: "2.0.0"
+spec:
+  # Number of pod copies to run simultaneously
+  # 2 provides redundancy - if one crashes, the other handles requests
+  replicas: 2  # Adjust based on workload
+  
+  # Tells deployment which pods to manage (must match template labels)
+  selector:
+    matchLabels:
+      app: cuda-eval-server
+  # Template describes the pods that will be created
+  template:
+    metadata:
+      # Labels identify pods for service discovery and load balancing
+      labels:
+        app: cuda-eval-server
+        version: "2.0.0"
+    spec:
+      # nodeSelector is the simplest way to constrain pods to nodes
+      # We comment it out here to use more flexible nodeAffinity below
+      nodeSelector:
+        # Example: force pods to run only on specific instance type
+        # node.kubernetes.io/instance-type: "ml.p5.48xlarge"
+      
+      # Affinity rules control where pods can be scheduled
+      # More flexible than nodeSelector - allows OR logic
+      affinity:
+        nodeAffinity:
+          # "required" means pod won't schedule if no matching nodes
+          # "IgnoredDuringExecution" means running pods stay if node labels change
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In  # Pod can run on ANY of these instance types
+                values:
+                - "ml.p5.48xlarge"    # H100 GPUs (newest, fastest)
+                - "ml.p5e.48xlarge"   # H200 GPUs (highest memory)
+                - "ml.p4d.24xlarge"   # A100 GPUs (widely available)
+      
+      # Tolerations allow pods to schedule on "tainted" nodes
+      # GPU nodes often have taints to prevent non-GPU workloads
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists  # Matches any value for this key
+        effect: NoSchedule  # Allows scheduling despite NoSchedule taint
+      
+      # Volumes define storage that can be mounted into containers
+      volumes:
+        # Shared memory is crucial for multi-process GPU apps (PyTorch DataLoader, NCCL)
+        # Without this, defaults to 64MB which causes "out of shared memory" errors
+        - name: shmem
+          hostPath:  # Mounts a path from the host node
+            path: /dev/shm  # Linux shared memory location
+            type: Directory  # Must already exist on host
+        
+        # NVMe SSDs on GPU instances provide fast local storage
+        # Much faster than EBS for temporary data
+        - name: local-nvme
+          hostPath:
+            path: /mnt/k8s-disks/0  # Standard path for instance store on EKS
+            type: DirectoryOrCreate  # Creates if doesn't exist
+        
+        # FSx for Lustre provides high-performance shared storage
+        # Optional - remove if you don't have FSx configured
+        - name: fsx-storage
+          persistentVolumeClaim:  # References a PVC you must create separately
+            claimName: fsx-claim  # Name of the PersistentVolumeClaim
+      
+      # Containers are the actual running processes in the pod
+      containers:
+        - name: cuda-eval-server
+          # Container image from ECR (Elastic Container Registry)
+          # Format: [account-id].dkr.ecr.[region].amazonaws.com/[repo]:[tag]
+          # TODO: Update with your ECR repository
+          image: 599801266352.dkr.ecr.us-east-2.amazonaws.com/rlmf:cuda-eval-server-v2-latest
+          
+          # When to pull the image:
+          # - Always: Pull every time (good for :latest tags)
+          # - IfNotPresent: Use cached if available (good for versioned tags)
+          # - Never: Only use local cache
+          imagePullPolicy: Always
+          
+          # Ports the container listens on
+          # This doesn't expose them externally - Service does that
+          ports:
+          - name: http  # Named port can be referenced by name in Service
+            containerPort: 8000  # Port inside the container
+            protocol: TCP
+          
+          # Readiness probe determines if pod can receive traffic
+          # Pod is removed from service endpoints if probe fails
+          readinessProbe:
+            httpGet:
+              path: /health  # Your app must implement this endpoint
+              port: 8000
+            initialDelaySeconds: 45  # Wait before first check (CUDA init is slow)
+            periodSeconds: 10  # Check every 10 seconds
+            timeoutSeconds: 5  # Fail if response takes > 5 seconds
+            successThreshold: 1  # Mark ready after 1 success
+            failureThreshold: 3  # Mark not ready after 3 failures
+          
+          # Liveness probe determines if pod is healthy
+          # Pod is restarted if probe fails
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60  # Wait longer than readiness
+            periodSeconds: 30  # Less frequent than readiness
+            timeoutSeconds: 10
+            failureThreshold: 3  # Restart after 3 consecutive failures
+          
+          # Startup probe gives time for slow container initialization
+          # Liveness/readiness probes are disabled until this succeeds
+          # Useful for apps with variable startup times
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30  # 30 * 10s = 5 minutes max startup time
+          
+          # Resource requests and limits control scheduling and throttling
+          resources:
+            # Requests: Minimum resources needed - used for scheduling
+            # Pod only schedules on nodes with at least this much free
+            requests:
+              nvidia.com/gpu: "8"  # All 8 GPUs (can't share GPUs)
+              vpc.amazonaws.com/efa: "4"  # Elastic Fabric Adapter for GPU communication
+              cpu: "48"  # 25% of instance CPUs (allows multiple pods)
+              memory: "512Gi"  # 25% of instance memory
+            # Limits: Maximum resources allowed - enforced by cgroups
+            # Pod is throttled (CPU) or killed (memory) if exceeds
+            limits:
+              nvidia.com/gpu: "8"  # GPUs can't be oversubscribed
+              vpc.amazonaws.com/efa: "4"
+              cpu: "96"  # Can burst to 50% of instance CPUs
+              memory: "1024Gi"  # Killed if exceeds (OOMKilled)
+          
+          # Environment variables passed to the container
+          env:
+            # CUDA configuration - controls GPU visibility
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"  # GPU compute and nvidia-smi
+            
+            # Python configuration
+            - name: PYTHONUNBUFFERED
+              value: "1"  # Ensures logs appear immediately (not buffered)
+            - name: PYTHONPATH
+              value: "/app:/app/KernelBench/scripts/cuda_eval_server_v2"  # Module search paths
+            
+            # NCU (NVIDIA Nsight Compute) profiling configuration
+            - name: ENABLE_DEVICE_METRICS
+              value: "true"  # Enable detailed GPU profiling
+            
+            # Server configuration
+            - name: LOG_LEVEL
+              value: "info"  # Logging verbosity (debug/info/warning/error)
+            
+            # Pod information injected from Kubernetes metadata
+            # Useful for debugging and logging
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name  # Actual pod name (e.g., cuda-eval-server-v2-5d7b9c4d5-x2n4j)
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace  # Kubernetes namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName  # Which EC2 instance pod is on
+          
+          # Command overrides the Docker CMD instruction
+          # Explicitly specify startup command for clarity
+          command: ["python3"]
+          # Arguments passed to the command
+          args:
+            - "main.py"
+            - "--host"
+            - "0.0.0.0"  # Listen on all interfaces (required for container)
+            - "--port"
+            - "8000"
+            - "--log-level"
+            - "info"
+          
+          # Volume mounts connect volumes to container filesystem
+          volumeMounts:
+            # Shared memory mount - critical for PyTorch/CUDA
+            - name: shmem
+              mountPath: /dev/shm  # Standard Linux shared memory path
+            
+            # Instance store NVMe - fastest available storage
+            - name: local-nvme
+              mountPath: /local  # Your app can use /local for temp files
+            
+            # FSx mount for shared data between pods
+            - name: fsx-storage
+              mountPath: /fsx  # Access shared filesystem at /fsx
+          
+          # Security context sets container security policies
+          securityContext:
+            allowPrivilegeEscalation: false  # Don't allow gaining privileges
+            runAsNonRoot: false  # NCU profiling requires root access
+            runAsUser: 0  # UID 0 = root (needed for GPU profiling)
+            seccompProfile:
+              type: Unconfined # Allows for NCU 
+            capabilities:
+              # Linux capabilities are fine-grained permissions
+              add:
+                - SYS_ADMIN  # Required for NCU to access GPU performance counters
+                - SYS_PTRACE  # Required for profiling other processes
+              drop:
+                - ALL  # Drop all other capabilities for security
+      
+      # Pod-level security context applies to all containers
+      securityContext:
+        fsGroup: 0  # File system group - files created will have this GID
+        supplementalGroups: [0]  # Additional groups for the pod
+      
+      # DNS configuration
+      dnsPolicy: ClusterFirst  # Use cluster DNS (CoreDNS in EKS)
+      
+      # What to do when container exits
+      restartPolicy: Always  # Always restart failed containers
+      
+      # Grace period before force-killing pod during deletion
+      # Allows graceful shutdown of connections
+      terminationGracePeriodSeconds: 60
+
+---
+# Service exposes pods to network traffic
+# It provides a stable endpoint even as pods come and go
+apiVersion: v1
+kind: Service
+metadata:
+  name: cuda-eval-service
+  labels:
+    app: cuda-eval-server
+spec:
+  # Service types:
+  # - ClusterIP: Internal only (default)
+  # - LoadBalancer: Creates AWS ELB for external access
+  # - NodePort: Exposes on each node's IP
+  type: ClusterIP  # Change to LoadBalancer for internet access
+  
+  # Selector determines which pods receive traffic
+  # Must match pod labels
+  selector:
+    app: cuda-eval-server
+  
+  ports:
+  - name: http
+    port: 8000  # Service port (what clients connect to)
+    targetPort: 8000  # Container port (where traffic goes)
+    protocol: TCP
+  
+  # Session affinity routes requests from same client to same pod
+  # None = round-robin, ClientIP = sticky sessions
+  sessionAffinity: None

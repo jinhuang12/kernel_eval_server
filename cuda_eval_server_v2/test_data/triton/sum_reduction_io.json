@@ -1,0 +1,82 @@
+{
+  "ref_kernel": {
+    "source_code": "\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, x):\n        return torch.sum(x, dim=1)\n",
+    "kernel_type": "torch",
+    "io": {
+      "args": [
+        {
+          "name": "x_ptr",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [256, 1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            }
+          }
+        }
+      ]
+    }  
+  },
+  "custom_kernel": {
+    "source_code": "\nimport torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef sum_kernel_naive(\n    x_ptr, output_ptr,\n    M, N,\n    BLOCK_SIZE_M: tl.constexpr,\n    BLOCK_SIZE_N: tl.constexpr,\n):\n    pid_m = tl.program_id(axis=0)\n    \n    m_offs = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    m_mask = m_offs < M\n    \n    accumulator = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)\n    \n    for n_start in range(0, N, BLOCK_SIZE_N):\n        n_offs = n_start + tl.arange(0, BLOCK_SIZE_N)\n        n_mask = n_offs < N\n        \n        ptrs = x_ptr + m_offs[:, None] * N + n_offs[None, :]\n        mask = m_mask[:, None] & n_mask[None, :]\n        x = tl.load(ptrs, mask=mask, other=0.0)\n        \n        accumulator += tl.sum(x, axis=1)\n    \n    output_ptrs = output_ptr + m_offs\n    tl.store(output_ptrs, accumulator, mask=m_mask)\n",
+    "kernel_type": "triton",
+    "io": {
+      "args": [
+        {
+          "name": "x_ptr",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [256, 1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            }
+          }
+        },
+        {
+          "name": "output_ptr",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [256],
+            "dtype": "float32"
+          }
+        },
+        {
+          "name": "M",
+          "type": "int",
+          "value": 256
+        },
+        {
+          "name": "N",
+          "type": "int",
+          "value": 1024
+        },
+        {
+          "name": "BLOCK_SIZE_M",
+          "type": "int",
+          "value": 32,
+          "is_meta": true
+        },
+        {
+          "name": "BLOCK_SIZE_N",
+          "type": "int",
+          "value": 256,
+          "is_meta": true
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 8
+        }
+      }
+    }
+  },
+  "num_trials": 10,
+  "timeout": 120
+}

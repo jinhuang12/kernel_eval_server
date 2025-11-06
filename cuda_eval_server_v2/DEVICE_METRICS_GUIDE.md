@@ -4,18 +4,11 @@
 
 The CUDA Evaluation Server V2 now supports capturing detailed device metrics during kernel profiling using NVIDIA NCU (Nsight Compute). This feature provides deep insights into GPU performance bottlenecks by collecting Speed of Light metrics, cache performance, pipeline utilization, and occupancy analysis for both reference PyTorch models and custom CUDA kernels.
 
-## Recent Updates (August 2025)
-
-- **Fixed NCU metric extraction**: Corrected all metric names to match actual NCU output
-- **Enhanced metric categories**: Now extracting 6 comprehensive metric categories
-- **Improved error handling**: Better handling of empty or missing metrics
-- **Accurate metric mapping**: Proper mapping between NCU metrics and simplified names
-
 ## Features
 
 ### 📊 Comprehensive Device Metrics
 
-The system now extracts six categories of metrics:
+The system now extracts ten categories of metrics:
 
 1. **Speed of Light Analysis**: Overall GPU utilization efficiency
 2. **Detailed Performance Metrics**: Cache hit rates, IPC, warp occupancy
@@ -23,6 +16,10 @@ The system now extracts six categories of metrics:
 4. **Compute Utilization Metrics**: Pipeline utilization, occupancy limiters
 5. **Pipeline Activity Metrics**: FMA, ALU, Tensor core active cycles
 6. **Occupancy Analysis**: Block/grid configuration, waves per SM
+7. Scheduler & Stall Diagnostics – warp issue eligibility and stall reasons
+8. Access‑Pattern Diagnostics – coalescing, L2 over‑fetch, shared‑mem bank conflicts
+9. Roofline Quantities – arithmetic intensity, FLOP/s
+10. Timing & Cycle Context – kernel duration and cycles for normalization
 
 ### 🔍 Key NCU Metrics Collected
 
@@ -56,6 +53,44 @@ The system now extracts six categories of metrics:
 - `launch__occupancy_limit_blocks` - Block limit
 - `launch__waves_per_multiprocessor` - Waves per SM (tail effects)
 
+#### Scheduler & Stall Diagnostics
+- `smsp__warps_eligible.avg.per_cycle_active` – Eligible warps per cycle
+- `smsp__inst_issued.avg.per_cycle_active` – Instructions issued per cycle
+- `smsp__issue_active.avg.pct_of_peak_sustained_active` – Issue slot activity
+- `smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct` – Waiting on long‑latency memory
+- `smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct` – Short dependency stalls
+- `smsp__warp_issue_stalled_barrier_per_warp_active.pct` – Barrier/sync stalls
+- `smsp__warp_issue_stalled_not_selected_per_warp_active.pct` – Eligible but not scheduled
+
+#### Access‑Pattern Diagnostics
+
+**Coalescing (requests vs sectors):**
+- `l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum`
+- `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum`
+- `l1tex__t_requests_pipe_lsu_mem_global_op_st.sum`
+- `l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum`
+- **L2 over‑fetch (ideal vs actual):**
+- `memory_l2_theoretical_sectors_global`
+- `memory_l2_theoretical_sectors_global_ideal`
+- `(Derived in parser) l2_theoretical_sectors_global_excessive = max(global − ideal, 0)`
+- **Shared‑memory bank conflicts:**
+- `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum`
+- `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum`
+#### Roofline Quantities
+- `FLOP counts (from sections): flop_count_sp, flop_count_hp, flop_count_dp, - `flop_count_tensor`
+- `Bytes/time: dram__bytes.sum, dram__bytes.avg.per_second, gpu__time_duration.sum`
+- **(Derived in parser):**
+  - `arithmetic_intensity = total_flops / dram_bytes_sum`
+  - `gflops = total_flops / duration_seconds / 1e9`
+#### Timing & Cycles
+- `gpu__time_duration.sum – Kernel duration (unit preserved, seconds derived)`
+- `gpc__cycles_elapsed.max – Elapsed cycles (for cycle‑level normalization)`
+#### 🧮 Derived Convenience Signals (added by parser)
+- `l1_load_sectors_per_req = sectors_ld / requests_ld`
+- `l1_store_sectors_per_req = sectors_st / requests_st`
+- `l2_excess_frac = excessive / global`
+- `arithmetic_intensity, gflops, and gpu_time_duration_seconds (when convertible)`
+
 ## Quick Start
 
 ### 1. Prerequisites
@@ -78,22 +113,7 @@ Set the environment variable to enable metrics:
 export ENABLE_DEVICE_METRICS=true
 ```
 
-### 3. Launch Server with NCU
-
-Use the provided wrapper script to launch the server with NCU profiling:
-
-```bash
-# Navigate to server directory
-cd AIRE-TFL-KernelBench/KernelBench/scripts/cuda_eval_server_v2/
-
-# Basic launch with default settings
-./run_with_ncu.sh
-
-# Custom configuration with specific sections
-./run_with_ncu.sh --port 8080 --ncu-sections "SpeedOfLight,Occupancy,ComputeWorkloadAnalysis,MemoryWorkloadAnalysis"
-```
-
-### 4. Send Evaluation Requests
+### 3. Send Evaluation Requests
 
 The API remains unchanged - device metrics are automatically captured:
 
@@ -107,7 +127,7 @@ curl -X POST "http://localhost:8000/" \
   }'
 ```
 
-### 5. Access Device Metrics
+### 4. Access Device Metrics
 
 Device metrics are included in the response payload with the corrected structure:
 
@@ -117,6 +137,7 @@ Device metrics are included in the response payload with the corrected structure
   "kernel_exec_result": {
     "metadata": {
       "device_metrics": {
+        // Kernel device metrics (/evaluate) | Reference kernel device metrics (/compare)
         "original_device_metrics": {
           "speed_of_light": {
             "compute_throughput_pct": 85.2,
@@ -172,8 +193,42 @@ Device metrics are included in the response payload with the corrected structure
             "block_size": 256,
             "grid_size": 1024,
             "shared_mem_per_block": 4096
+          },
+          "stall_metrics": {
+            "stall_long_scoreboard_pct": 28.4,
+            "stall_short_scoreboard_pct": 6.1,
+            "stall_barrier_pct": 2.7,
+            "stall_not_selected_pct": 14.9
+          },
+          "scheduler_metrics": {
+            "warps_eligible_per_cycle": 5.6,
+            "inst_issued_per_cycle": 2.9,
+            "issue_active_pct": 71.2
+          },
+          "access_pattern_metrics": {
+            "l1_load_sectors_per_req": 1.85,
+            "l1_store_sectors_per_req": 2.10,
+            "l2_theoretical_sectors_global": 1.23e8,
+            "l2_theoretical_sectors_global_ideal": 9.10e7,
+            "l2_theoretical_sectors_global_excessive": 3.20e7,
+            "l2_excess_frac": 0.26,
+            "shared_bank_conflicts_load_sum": 4096,
+            "shared_bank_conflicts_store_sum": 0
+          },
+          "roofline_metrics": {
+            "flop_count_total": 2.10e12,
+            "dram_bytes_sum": 5.80e11,
+            "arithmetic_intensity": 3.62,
+            "gflops": 14500.0
+          },
+          "timing_metrics": {
+            "gpu_time_duration_sum": 14.5,
+            "gpu_time_duration_unit": "ms",
+            "gpu_time_duration_seconds": 0.0145,
+            "gpc_cycles_elapsed_max": 3.1e8
           }
         },
+        // Candidate device metrics (if using /compare endpoint)
         "custom_device_metrics": {
           "speed_of_light": {
             "compute_throughput_pct": 78.9,
@@ -200,7 +255,7 @@ Device metrics are included in the response payload with the corrected structure
 export ENABLE_DEVICE_METRICS=true
 
 # Specify NCU sections to collect
-export NCU_SECTIONS="SpeedOfLight,Occupancy,ComputeWorkloadAnalysis,MemoryWorkloadAnalysis"
+export NCU_SECTIONS="SpeedOfLight,Occupancy,ComputeWorkloadAnalysis,MemoryWorkloadAnalysis,LaunchStats,SchedulerStats,WarpStateStats,SourceCounters,InstructionStats,SpeedOfLight_RooflineChart"
 
 # Set NCU report output directory
 export NCU_REPORT_DIR="/tmp"
@@ -208,27 +263,19 @@ export NCU_REPORT_DIR="/tmp"
 
 ### NCU Sections for Optimal Metrics
 
-| Section | Metrics Provided | Performance Impact |
-|---------|------------------|-------------------|
-| `SpeedOfLight` | Overall GPU utilization | Low (~2x overhead) |
-| `Occupancy` | Thread/warp/block utilization | Low |
-| `ComputeWorkloadAnalysis` | Pipeline utilization, IPC | Medium (~3x overhead) |
-| `MemoryWorkloadAnalysis` | Cache hits, bandwidth | Medium |
-| `InstructionStats` | Instruction mix analysis | High (~5x overhead) |
-| `SchedulerStats` | Warp scheduling efficiency | High |
+| Section                      | Metrics Provided                            | Perf. Impact |
+| ---------------------------- | ------------------------------------------- | ------------ |
+| `SpeedOfLight`               | Overall GPU utilization vs sustainable peak | Low          |
+| `Occupancy`                  | Thread/warp/block occupancy & limits        | Low          |
+| `ComputeWorkloadAnalysis`    | Pipeline utilization, IPC                   | Medium       |
+| `MemoryWorkloadAnalysis`     | Cache hits, bandwidth, memory paths         | Medium       |
+| `LaunchStats`                | Block/grid/SM launch context                | Low          |
+| `SchedulerStats`             | Warps eligible/issued; issue slot activity  | High         |
+| `WarpStateStats`             | Warp state/stall sampling                   | High         |
+| `SourceCounters`             | Source‑level counters & derived diagnostics | High         |
+| `InstructionStats`           | Instruction mix & flop counts               | High         |
+| `SpeedOfLight_RooflineChart` | Arithmetic intensity & roofline positioning | Low‑Medium   |
 
-### Recommended Section Combinations
-
-```bash
-# Fast profiling (minimal overhead)
-export NCU_SECTIONS="SpeedOfLight,Occupancy"
-
-# Balanced profiling (good insights, moderate overhead)
-export NCU_SECTIONS="SpeedOfLight,Occupancy,ComputeWorkloadAnalysis,MemoryWorkloadAnalysis"
-
-# Comprehensive profiling (maximum insights, high overhead)
-export NCU_SECTIONS="SpeedOfLight,Occupancy,ComputeWorkloadAnalysis,MemoryWorkloadAnalysis,InstructionStats,SchedulerStats"
-```
 
 ## Understanding Device Metrics
 

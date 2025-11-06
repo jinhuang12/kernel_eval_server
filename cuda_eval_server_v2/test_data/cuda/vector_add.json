@@ -1,0 +1,105 @@
+{
+  "ref_kernel": {
+    "source_code": "\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, a, b):\n        return a + b\n",
+    "kernel_type": "torch",
+    "io": {
+      "args": [
+        {
+          "name": "a",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "full",
+              "fill_value": 2.0
+            }
+          }
+        },
+        {
+          "name": "b",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "full",
+              "fill_value": 3.0
+            }
+          }
+        }
+      ]
+    }
+  },
+  "custom_kernel": {
+    "source_code": "__global__ void vector_add(float* a, float* b, float* c, int n) {\n    int tid = blockIdx.x * blockDim.x + threadIdx.x;\n    if (tid < n) {\n        c[tid] = a[tid] + b[tid];\n    }\n}",
+    "kernel_type": "cuda",
+    "io": {
+      "args": [
+        {
+          "name": "a",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "full",
+              "fill_value": 2.0
+            }
+          }
+        },
+        {
+          "name": "b",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "full",
+              "fill_value": 3.0
+            }
+          }
+        },
+        {
+          "name": "c",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "zeros"
+            }
+          }
+        },
+        {
+          "name": "n",
+          "type": "int",
+          "role": "input",
+          "value": 1024
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 4,
+          "y": 1,
+          "z": 1
+        },
+        "block": {
+          "x": 256,
+          "y": 1,
+          "z": 1
+        }
+      }
+    },
+    "metadata": {
+      "kernel_name": "vector_add"
+    }
+  },
+  "num_trials": 100,
+  "timeout": 30
+}

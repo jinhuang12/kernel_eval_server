@@ -8,10 +8,12 @@ import logging
 import asyncio
 import torch
 import traceback
+import numpy as np
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 
-from shared.models import BaseExecutableKernel, ProfilingResult
+from shared.models import BaseExecutableKernel, ProfilingResult, CompareProfilingResult
+from shared.executable_kernels import MultiKernelExecutableKernel
 from shared.metrics_collector import get_metrics_collector
 
 logger = logging.getLogger(__name__)
@@ -45,80 +47,119 @@ class ProfilingService:
     def __init__(self):
         self.metrics_collector = get_metrics_collector()
     
-    def profile(
-        self,
-        ref_kernel: BaseExecutableKernel,
-        custom_kernel: BaseExecutableKernel,
-        num_trials: int = 100,
-        job_id: Optional[str] = None,
-        gpu_id: Optional[int] = None
-    ) -> ProfilingResult:
+    def _calculate_runtime_stats(self, elapsed_times: List[float]) -> Dict[str, float]:
         """
-        Run separated profiling using pre-validated compiled kernel info
-        NO correctness validation - assumes compilation service already validated
+        Calculate comprehensive runtime statistics including percentiles.
         
         Args:
-            ref_kernel: Kernel to profile
-            num_trials: Number of performance measurement trials
-            job_id: Optional job identifier
-            gpu_id: Optional GPU ID to use (if provided, avoids GPU acquisition)
+            elapsed_times: List of elapsed times in milliseconds
             
         Returns:
-            ProfilingResults with validation and timing data
+            Dict containing mean, std, min, max, median, percentile_95, percentile_99
+            All timings are in milliseconds
+        """
+        times_array = np.array(elapsed_times)
+        
+        stats = {
+            "mean": float(np.mean(times_array)),
+            "std": float(np.std(times_array)),
+            "min": float(np.min(times_array)),
+            "max": float(np.max(times_array)),
+            "median": float(np.median(times_array)),
+            "percentile_95": float(np.percentile(times_array, 95)),
+            "percentile_99": float(np.percentile(times_array, 99))
+        }
+        
+        # Round to 3 significant figures for consistency
+        for key in stats:
+            stats[key] = round(stats[key], 3)
+        
+        return stats
+    
+    def profile(
+        self,
+        kernel: BaseExecutableKernel,
+        job_id: str,
+        num_trials: int = 100,
+        gpu_id: Optional[int] = None,
+        profiling_method: str = "cuda_graphs",
+    ) -> ProfilingResult:
+        """
+        Profile a single kernel's performance
+        
+        Args:
+            kernel: Kernel to profile
+            job_id: Job identifier
+            num_trials: Number of performance measurement trials
+            gpu_id: Optional GPU ID to use
+            
+        Returns:
+            ProfilingResult with runtime statistics
         """
         profiling_start_time = time.time()
         success = False
         device = torch.device(f"cuda:{gpu_id}")
         
-        # Use provided GPU ID directly (no acquisition needed)
-        logger.info(f"Job {job_id}: Profiling using provided GPU {gpu_id} (same as compilation)")
+        # Use provided GPU ID directly
+        logger.info(f"Job {job_id}: Profiling kernel using GPU {gpu_id}")
+
+        # Auto-detect multi_kernel types and use cuda_events to avoid allocator corruption
+        # Multi-kernel types often contain non-capturable operations (torch.unique, torch.sort, etc.)
+        if isinstance(kernel, MultiKernelExecutableKernel) and profiling_method == "cuda_graphs":
+            logger.info(
+                f"Job {job_id}: Multi-kernel detected, automatically using cuda_events "
+                f"to avoid non-capturable operations that would corrupt CUDA allocator"
+            )
+            profiling_method = "cuda_events"
+
+        profile_with_cuda_graphs = profiling_method == "cuda_graphs"
         try:
-            # Step 1: Profile reference model (try CUDA graphs)
-            ref_elapsed_times, ref_method = self._time_with_cuda_graph(
-                ref_kernel.with_profiling(use_cuda_graphs=True), *ref_kernel._default_inputs, num_trials=num_trials, device=device
-            )
-            original_stats = get_timing_stats(ref_elapsed_times, device=device)
+            # Profile the kernel (try CUDA graphs first)
+            if profile_with_cuda_graphs:
+                elapsed_times, method = self._time_with_cuda_graph(
+                    kernel.with_profiling(use_cuda_graphs=profile_with_cuda_graphs), *kernel._default_inputs, 
+                    num_trials=num_trials, device=device
+                )
+            else:
+                elapsed_times = time_execution_with_cuda_event(
+                    kernel.with_profiling(use_cuda_graphs=profile_with_cuda_graphs), *kernel._default_inputs, 
+                    num_trials=num_trials, verbose=False, device=device
+                )
+                method = 'cuda_events'
+
+            # Use our comprehensive stats calculation
+            runtime_stats = self._calculate_runtime_stats(elapsed_times)
             
-            logger.info(f"Reference model performance: {original_stats}, profile mode: {ref_method}")
+            # Get hardware and device info separately for metadata
+            hardware = torch.cuda.get_device_name(device=device) if device else "unknown"
+            device_str = str(device)
             
-            # Run with CUDA graphs if reference kernel executed successfully w/ CUDA graphs 
-            custom_kernel = custom_kernel.with_profiling(ref_method == 'cuda_graphs')
-            custom_elapsed_times, custom_method = self._time_with_cuda_graph(
-                custom_kernel, *ref_kernel._default_inputs, num_trials=num_trials, device=device
-            )
-            custom_stats = get_timing_stats(custom_elapsed_times, device=device)
-            logger.info(f"Custom model performance: {original_stats}")
-            
-            # Step 3: Aggregate results
-            logger.info("Step 3: Aggregating profiling results")
-            
-            # Calculate speedup
-            speedup = original_stats["mean"] / custom_stats["mean"] if custom_stats["mean"] > 0 else 0
+            logger.info(f"Kernel performance: {runtime_stats}, profile mode: {method}")
             
             metadata = {
-                "device": str(device),
+                "device": device_str,
                 "gpu_id": gpu_id,
                 "num_trials": num_trials,
-                "speedup": speedup,
-                "hardware": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "unknown"
+                "profiling_method": method,
+                "hardware": hardware
             }
             
-            logger.info(f"Profiling completed successfully. Correctness: PASSED (pre-validated), Speedup: {speedup:.2f}x")
+            logger.info(f"Profiling completed successfully")
             success = True
             
             return ProfilingResult(
                 success=True,
-                original_runtime=original_stats,
-                custom_runtime=custom_stats,
+                runtime_stats=runtime_stats,
                 gpu_id=gpu_id,
                 metadata=metadata
             )
                 
         except Exception as e:
-            logger.error(f"Streamlined profiling failed for job {job_id}: {e}")
+            logger.error(f"Profiling failed for job {job_id}: {e}")
             return ProfilingResult(
                 success=False,
-                error=f"Profiling error: {str(e)}"
+                runtime_stats={},
+                error=f"Profiling error:\n{traceback.format_exc()}"
             )
         finally:
             # Record profiling completion for metrics
@@ -128,10 +169,113 @@ class ProfilingService:
                 success,
                 profiling_time,
                 gpu_id if gpu_id is not None else None,
-                True if success else None  # correctness
+                None  # No correctness check for single kernel
             )
             with device:
                 torch.cuda.empty_cache()
+    
+    def compare_profile(
+        self,
+        ref_kernel: BaseExecutableKernel,
+        custom_kernel: BaseExecutableKernel,
+        job_id: str,
+        num_trials: int = 100,
+        gpu_id: Optional[int] = None
+    ) -> CompareProfilingResult:
+        """
+        Compare two kernels by profiling each and calculating speedup
+        
+        Args:
+            ref_kernel: Reference kernel to profile
+            custom_kernel: Custom kernel to profile
+            job_id: Job identifier
+            num_trials: Number of performance measurement trials
+            gpu_id: Optional GPU ID to use
+            
+        Returns:
+            CompareProfilingResult with comparison metrics
+        """
+        profiling_start_time = time.time()
+        success = False
+
+        # Auto-detect if either kernel is multi_kernel and use cuda_events for both
+        # This ensures fair comparison and avoids allocator corruption
+        forced_profiling_method = None
+        if isinstance(ref_kernel, MultiKernelExecutableKernel) or isinstance(custom_kernel, MultiKernelExecutableKernel):
+            logger.info(
+                f"Job {job_id}: Multi-kernel detected in comparison, "
+                f"using cuda_events for both kernels for fair comparison"
+            )
+            forced_profiling_method = "cuda_events"
+
+        try:
+            # Profile reference kernel
+            ref_result = self.profile(
+                ref_kernel, job_id, num_trials, gpu_id,
+                profiling_method=forced_profiling_method or "cuda_graphs"
+            )
+
+            if not ref_result.success:
+                return CompareProfilingResult(
+                    success=False,
+                    error=f"Reference kernel profiling failed: {ref_result.error}"
+                )
+
+            # Use same profiling method for custom kernel (either forced or from ref result)
+            custom_profiling_method = forced_profiling_method or ref_result.metadata.get('profiling_method', 'cuda_graphs')
+            # Profile custom kernel
+            custom_result = self.profile(
+                custom_kernel, job_id, num_trials, gpu_id,
+                profiling_method=custom_profiling_method
+            )
+            
+            if not custom_result.success:
+                return CompareProfilingResult(
+                    success=False,
+                    error=f"Custom kernel profiling failed: {custom_result.error}"
+                )
+            
+            # Calculate speedup
+            ref_mean = ref_result.runtime_stats.get("mean", 0)
+            custom_mean = custom_result.runtime_stats.get("mean", 0)
+            speedup = ref_mean / custom_mean if custom_mean > 0 else 0
+            
+            # Combine metadata
+            combined_metadata = {
+                **ref_result.metadata,
+                "speedup": speedup,
+                "ref_profiling_method": ref_result.metadata.get("profiling_method"),
+                "custom_profiling_method": custom_result.metadata.get("profiling_method")
+            }
+            
+            logger.info(f"Comparison profiling completed. Speedup: {speedup:.2f}x")
+            success = True
+            
+            return CompareProfilingResult(
+                success=True,
+                original_runtime=ref_result.runtime_stats,
+                custom_runtime=custom_result.runtime_stats,
+                speedup=speedup,
+                gpu_id=gpu_id,
+                metadata=combined_metadata
+            )
+            
+        except Exception as e:
+            logger.error(f"Comparison profiling failed for job {job_id}: {e}")
+            return CompareProfilingResult(
+                success=False,
+                error=f"Comparison profiling error:\n{traceback.format_exc()}"
+            )
+        finally:
+            # Record profiling completion for metrics
+            profiling_time = time.time() - profiling_start_time
+            self.metrics_collector.record_profiling_end(
+                job_id or "unknown",
+                success,
+                profiling_time,
+                gpu_id if gpu_id is not None else None,
+                True if success else None  # correctness for comparison
+            )
 
     def _time_with_cuda_graph(self, kernel_fn, *args, num_trials=100, device=None):
         """
@@ -182,11 +326,11 @@ class ProfilingService:
             
             # Create graph object
             g = torch.cuda.CUDAGraph()
-            
+
             # Capture the graph on the NON-DEFAULT stream
             with torch.cuda.graph(g, stream=capture_stream), torch.no_grad():
                 static_output = kernel_fn(*static_args)
-            
+
             # Synchronize after capture
             torch.cuda.synchronize()
             
@@ -218,27 +362,52 @@ class ProfilingService:
                 elapsed_times.append(start_events[i].elapsed_time(end_events[i]))
                     
         except Exception as e:
-            import traceback
             traceback.print_exc()
-            logger.warning(f"Falling back to CUDA events profiling, CUDA Graphs capture failed with: {str(e)}")
-            
-            # Fallback to regular events
-            elapsed_times = time_execution_with_cuda_event(
-                kernel_fn, *args, 
-                num_trials=num_trials,
-                verbose=False,
-                device=device
+            logger.error(f"CUDA Graphs capture failed: {str(e)}")
+
+            # CRITICAL: When CUDA graph capture fails, PyTorch's allocator enters a corrupted
+            # state where captures_underway counter is not properly reset. This is a known
+            # PyTorch limitation with no public API to fix it.
+            #
+            # The allocator will reject ALL subsequent GPU memory allocations in this process,
+            # making fallback to CUDA events impossible.
+            #
+            # Note: Multi-kernel types are automatically profiled with cuda_events to avoid
+            # this issue. If this error occurs, it's likely a non-multi-kernel type that
+            # contains non-capturable operations.
+
+            logger.error(
+                f"Cannot fallback to CUDA events after failed graph capture - "
+                f"CUDA allocator is corrupted. Kernel contains non-capturable operations "
+                f"like torch.unique(), torch.sort(), torch.nonzero(), etc."
             )
-            method = 'cuda_events'
+
+            raise RuntimeError(
+                f"CUDA graph capture failed: {str(e)}. "
+                f"Kernel contains non-capturable operations. "
+                f"This shouldn't happen for multi_kernel types (auto-detected). "
+                f"For other kernel types, use profiling_method='cuda_events'."
+            ) from e
             
         return elapsed_times, method
     
+    def _capture_device_metrics(self, exec_kernel, inputs, job_id: str, kind: str):
+        """
+        Profile exactly ONE replay under graphs using NVTX delimiters.
+        Parent NCU is launched with --nvtx-include f"{job_id}_{kind}/graph_profile" 
+        and --graph-profiling node, so this single replay is captured.
+        """
+        tag = f"{job_id}_{kind}/"
+        torch.cuda.nvtx.range_push(tag)
+        exec_kernel(*inputs)   # single replay is profiled
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+    
     async def health_check(self) -> Dict[str, Any]:
-        """Health check for separated profiling service"""
+        """Health check for profiling service"""
         return {
             "status": "healthy",
             "cuda_available": torch.cuda.is_available(),
             "kb_functions_available": KB_FUNCTIONS_AVAILABLE,
-            "total_gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-            "available_gpus": self.gpu_manager.get_available_gpu_count()
+            "total_gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0
         }

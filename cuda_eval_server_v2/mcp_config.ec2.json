@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "cuda-eval-server-ec2": {
+      "command": "ssh",
+      "args": [
+        "p5e-cmh",
+        "cd ~/AIRE-TFL-KernelBench/KernelBench/scripts/cuda_eval_server_v2 && /home/ubuntu/miniconda3/bin/conda run -n base python main.py --mode mcp --log-level info"
+      ],
+      "env": {
+        "GPU_DEVICE": "0",
+        "ENABLE_DEVICE_METRICS": "false",
+        "LOG_LEVEL": "INFO",
+        "CUPY_KERNEL_CACHE_DIR": "/tmp/cupy_kernel_cache"
+      }
+    }
+  }
+}

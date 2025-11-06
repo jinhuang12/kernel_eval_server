@@ -1,0 +1,91 @@
+{
+  "ref_kernel": {
+    "source_code": "\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, x):\n        return torch.sum(x, dim=1)\n",
+    "kernel_type": "torch",
+    "io": {
+      "args": [
+        {
+          "name": "x",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [256, 1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            }
+          }
+        }
+      ]
+    }  
+  },
+  "custom_kernel": {
+    "source_code": "__global__ void sum_reduction(float* input, float* output, int M, int N, int stride) {\n    extern __shared__ float sdata[];\n    \n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    int blockSize = blockDim.x;\n    \n    if (row >= M) return;\n    \n    float sum = 0.0f;\n    for (int i = tid; i < N; i += blockSize) {\n        sum += input[row * stride + i];\n    }\n    sdata[tid] = sum;\n    \n    __syncthreads();\n    \n    for (int s = blockSize / 2; s > 0; s >>= 1) {\n        if (tid < s) {\n            sdata[tid] += sdata[tid + s];\n        }\n        __syncthreads();\n    }\n    \n    if (tid == 0) {\n        output[row] = sdata[0];\n    }\n}",
+    "kernel_type": "cuda",
+    "io": {
+      "args": [
+        {
+          "name": "input",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [256, 1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            }
+          }
+        },
+        {
+          "name": "output",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [256],
+            "dtype": "float32",
+            "init": {
+              "kind": "zeros"
+            }
+          }
+        },
+        {
+          "name": "M",
+          "type": "int",
+          "role": "input",
+          "value": 256
+        },
+        {
+          "name": "N",
+          "type": "int",
+          "role": "input",
+          "value": 1024
+        },
+        {
+          "name": "stride",
+          "type": "int",
+          "role": "input",
+          "value": 1024
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 256,
+          "y": 1,
+          "z": 1
+        },
+        "block": {
+          "x": 256,
+          "y": 1,
+          "z": 1
+        }
+      }
+    },
+    "metadata": {
+      "kernel_name": "sum_reduction"
+    }
+  },
+  "num_trials": 10,
+  "timeout": 120
+}

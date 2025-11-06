@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  cuda-eval-server:
+    image: cuda-eval-server:latest
+    runtime: nvidia
+    user: root
+    # entrypoint: /bin/bash
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=info
+      - ENABLE_DEVICE_METRICS=true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

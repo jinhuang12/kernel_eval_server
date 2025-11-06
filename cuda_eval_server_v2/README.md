@@ -1,310 +1,450 @@
-# CUDA Evaluation Server V2 - Backend-Based Kernel Compilation & Profiling
+# CUDA Evaluation Server V2
 
-🚀 **Flexible kernel evaluation server with pluggable compilation backends for multiple kernel types**
+**Compile, validate, and profile GPU kernels with a simple REST API**
 
-## Overview
+## What is this?
 
-This is a refactored version of the CUDA kernel evaluation server featuring:
+A production-ready server that evaluates GPU kernel performance. Send your kernel code, get back detailed performance metrics.
 
-- **Backend Pattern Architecture**: Pluggable compilation backends for different kernel types
-- **Multi-Kernel Support**: TORCH, TORCH_CUDA, TRITON, and CUDA kernels (CUDA in development)
-- **FastAPI + Async**: Non-blocking request handling with subprocess isolation
-- **IOContract Integration**: Comprehensive input/output specifications embedded in KernelCode
-- **Tensor Transfer Support**: Transfer tensors over FastAPI with compression or generate them server-side
-- **Triton Kernel Support**: Full support for Triton kernel compilation and execution
-- **Subprocess Safety**: Isolated execution prevents kernel crashes from affecting the server
-- **Device Metrics Collection**: Optional NCU profiling for detailed GPU performance analysis
-- **Extensible Design**: Easy to add new kernel types and compilation backends
+### The Problem
+- Writing optimized GPU kernels is hard
+- Testing performance requires complex boilerplate code  
+- Comparing different implementations is tedious
+- Profiling needs specialized tools and expertise
 
-## Architecture
+### The Solution
+This server handles all the complexity. You send code, we handle:
+- ✅ Compilation across different frameworks (PyTorch, CUDA, Triton)
+- ✅ Performance profiling with statistical analysis
+- ✅ Correctness validation between implementations
+- ✅ Detailed GPU metrics collection (optional NCU profiling)
+- ✅ Safe execution in isolated subprocesses
 
-```
-┌─────────┐    ┌──────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│ Request │───▶│   FastAPI    │───▶│   JobManager     │───▶│   Subprocess    │
-│         │    │   (app.py)   │    │ (Orchestration)  │    │     Worker      │
-└─────────┘    └──────────────┘    └──────────────────┘    └─────────────────┘
-                                            │                        │
-                                            ▼                        ▼
-                                    ┌───────────────┐      ┌─────────────────┐
-                                    │ GPU Resource  │      │  Compilation    │
-                                    │   Manager     │      │    Service      │
-                                    └───────────────┘      └─────────────────┘
-                                                                     │
-                                                            ┌────────┴────────┐
-                                                            ▼                 ▼
-                                                    ┌──────────────┐  ┌──────────────┐
-                                                    │ TorchCuda    │  │    Torch     │
-                                                    │   Backend    │  │   Backend    │
-                                                    └──────────────┘  └──────────────┘
-```
+## Quick Start (5 minutes)
 
-### Components
+### System Requirements
+- **GPU**: NVIDIA GPU with CUDA Capability 8.0+ (A100, H100, H200 etc.)
+- **CUDA**: Version 12.0 or higher
+- **Python**: 3.11+
+- **OS**: Linux (Ubuntu 22.04+ recommended)
 
-1. **Frontend** (`app.py`): FastAPI server with async request handlers
-2. **Job Manager** (`orchestration/job_manager.py`): Orchestrates evaluation workflow using subprocess workers
-3. **Compilation Service** (`compilation/compiler_service.py`): Backend-based kernel compilation
-4. **Compilation Backends**:
-   - `TorchCudaCompilationBackend`: For PyTorch models with embedded CUDA
-   - `TorchCompilationBackend`: For pure PyTorch reference models
-   - `TritonCompilationBackend`: For Triton kernel implementations
-5. **Validation Service** (`validation/`): Kernel correctness validation
-6. **Profiling Service** (`profiling/kernel_profiler.py`): Performance measurement with CUDA graphs support
-7. **Subprocess Worker** (`subprocess_worker.py`): Isolated execution environment
-
-## Quick Start
-
-### Prerequisites
+### Option 1: Docker (Recommended)
 
 ```bash
-# Core dependencies
-pip install fastapi>=0.104.0 uvicorn[standard]>=0.24.0
-pip install torch>=2.6.0 numpy>=1.21.0
+# Pull and run the server
+docker pull 592892253131.dkr.ecr.us-east-1.amazonaws.com/cuda-eval-server:latest
+docker run -it --rm --name cuda-eval-server --user root --cap-add=SYS_ADMIN --security-opt seccomp=unconfined -p 8000:8000 --gpus all -e NVIDIA_DRIVER_CAPABILITIES=compute,utility -e PYTHONUNBUFFERED=1 -e ENABLE_DEVICE_METRICS=true -e LOG_LEVEL=info 592892253131.dkr.ecr.us-east-1.amazonaws.com/cuda-eval-server:latest
 
-# Optional: For C++ wrapper transformation
-pip install libclang>=16.0.0
+# Or build & run it from source
+./docker-build.sh && ./docker-run.sh --gpu all
 
-# Optional: NVIDIA Nsight Compute for device metrics
-# Download from: https://developer.nvidia.com/nsight-compute
+# Verify it's running
+curl http://localhost:8000/health
+# Expected: {"status": "healthy", "gpu_available": true, "gpu_count": 1}
 ```
 
-### Running the Server
+### Option 2: Local Installation
 
 ```bash
-# Navigate to server directory
-cd AIRE-TFL-KernelBench/KernelBench/scripts/cuda_eval_server_v2/
+# Clone the repository
+git clone https://github.com/your-org/KernelBench.git
+cd KernelBench/scripts/cuda_eval_server_v2
 
-# Basic launch
+# Install dependencies
+pip install -r ../../../requirements.eval_server_v2.txt
+
+# Start the server
 python main.py
 
-# With options
-python main.py --host 0.0.0.0 --port 8000 --log-level info
-
-# With NCU device metrics
-ENABLE_DEVICE_METRICS=true python main.py
+# Verify installation
+curl http://localhost:8000/health
 ```
 
-## API Usage
+### Your First Request
 
-### Primary Endpoint
+Evaluate a simple PyTorch kernel:
 
-The server supports both legacy and new API formats:
-
-#### New Format (Recommended)
 ```bash
-curl -X POST "http://localhost:8000/" \
+curl -X POST http://localhost:8000/evaluate \
   -H "Content-Type: application/json" \
   -d '{
-    "ref_kernel": {
-      "source_code": "...",
+    "kernel": {
+      "source_code": "class Model(torch.nn.Module):\n    def forward(self, x):\n        return torch.relu(x)",
       "kernel_type": "torch"
     },
-    "custom_kernel": {
-      "source_code": "...",
-      "kernel_type": "torch_cuda"
-    },
-    "num_trials": 100,
-    "timeout": 120
-  }'
-```
-
-#### Legacy Format (Backward Compatible)
-```bash
-curl -X POST "http://localhost:8000/" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "ref_code": "...",
-    "custom_code": "...",
     "num_trials": 100
   }'
 ```
 
-### Kernel Types
+Expected response:
+```json
+{
+  "status": "success",
+  "kernel_exec_result": {
+    "compiled": true,
+    "runtime": 0.123,
+    "runtime_stats": {
+      "mean": 0.123,
+      "std": 0.005,
+      "median": 0.122,
+      "percentile_95": 0.130
+    }
+  }
+}
+```
 
-| Type | Description | Example Use | Status |
-|------|-------------|-------------|--------|
-| `TORCH` | Pure PyTorch models | Reference implementations | ✅ Fully Supported |
-| `TORCH_CUDA` | PyTorch with embedded CUDA | Generated kernels with load_inline | ✅ Fully Supported |
-| `TRITON` | Triton kernels | Triton kernel implementations | ✅ Fully Supported |
-| `CUDA` | Raw CUDA kernels | Direct CUDA code | 🚧 In Development |
+## Core Concepts
+
+### What's a Kernel?
+A **kernel** is code that runs on the GPU. Think of it as a function optimized for parallel computation. We support multiple types:
+
+- **PyTorch**: Standard deep learning models and operations
+- **CUDA**: Low-level C++ code for maximum control
+- **Triton**: Python-like language for writing GPU kernels
+- **PyTorch+CUDA**: PyTorch models with embedded custom CUDA
+
+### What Does the Server Do?
+
+```
+Your Code → [Server] → Performance Metrics
+              ↓
+        1. Compile
+        2. Validate 
+        3. Profile
+        4. Analyze
+```
+
+The server:
+1. **Receives** your kernel code via REST API
+2. **Compiles** it for your specific GPU
+3. **Validates** correctness (when comparing kernels)
+4. **Profiles** performance over multiple trials
+5. **Returns** detailed metrics and statistics
+
+## API Overview
+
+### Two Main Operations
+
+#### 1. Evaluate Single Kernel (`/evaluate`)
+**Use when**: Measuring standalone performance
+
+```python
+import requests
+
+response = requests.post("http://localhost:8000/evaluate", json={
+    "kernel": {
+        "source_code": "class Model(torch.nn.Module):\n    def forward(self, x):\n        return x * 2",
+        "kernel_type": "torch"
+    },
+    "num_trials": 100,
+    "timeout": 120
+})
+
+result = response.json()
+print(f"Runtime: {result['kernel_exec_result']['runtime']}ms")
+```
+
+#### 2. Compare Two Kernels (`/compare`)
+**Use when**: A/B testing implementations
+
+```python
+response = requests.post("http://localhost:8000/compare", json={
+    "ref_kernel": {
+        "source_code": "class Model(torch.nn.Module):\n    def forward(self, x):\n        return torch.matmul(x, x.T)",
+        "kernel_type": "torch"
+    },
+    "custom_kernel": {
+        "source_code": "class Model(torch.nn.Module):\n    def forward(self, x):\n        return custom_matmul(x, x.T)",  # Your optimized version
+        "kernel_type": "torch_cuda"
+    },
+    "num_trials": 200
+})
+
+result = response.json()
+if result['kernel_exec_result']['correctness']:
+    speedup = result['ref_runtime']['mean'] / result['kernel_exec_result']['runtime']
+    print(f"Speedup: {speedup:.2f}x")
+```
+
+### Understanding Responses
+
+```python
+{
+    "status": "success",              # Request status
+    "kernel_exec_result": {
+        "compiled": true,             # Did compilation succeed?
+        "correctness": true,          # Does output match reference? (compare only)
+        "runtime": 1.23,              # Mean runtime in milliseconds
+        "runtime_stats": {            # Detailed statistics
+            "mean": 1.23,
+            "std": 0.05,
+            "min": 1.18,
+            "max": 1.35,
+            "median": 1.22,
+            "percentile_95": 1.30,
+            "percentile_99": 1.33
+        },
+        "compilation_error": null,    # Error message if compilation failed
+        "validation_error": null       # Error message if validation failed
+    }
+}
+```
+
+## Supported Kernel Types
+
+| Type | Use Case | Example | IOContract Required |
+|------|----------|---------|---------------------|
+| `torch` | Standard ML models | ResNet, Transformers | No (auto-generates) |
+| `torch_cuda` | PyTorch + custom CUDA | Optimized operators | No (uses get_inputs()) |
+| `triton` | Custom GPU kernels | Matrix multiplication | **Yes** |
+| `cuda` | Raw CUDA C++ | Low-level optimizations | **Yes** |
+
+## Common Use Cases
+
+### 1. Benchmark a PyTorch Model
+
+```python
+# Evaluate a transformer layer
+response = requests.post("http://localhost:8000/evaluate", json={
+    "kernel": {
+        "source_code": """
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(512, 8)
+    
+    def forward(self, x):
+        return self.attention(x, x, x)[0]
+""",
+        "kernel_type": "torch"
+    },
+    "num_trials": 100
+})
+```
+
+### 2. Compare Optimization Strategies
+
+```python
+# Compare standard vs flash attention
+response = requests.post("http://localhost:8000/compare", json={
+    "ref_kernel": {
+        "source_code": "# Standard attention implementation",
+        "kernel_type": "torch"
+    },
+    "custom_kernel": {
+        "source_code": "# Flash attention implementation",
+        "kernel_type": "torch_cuda"
+    },
+    "num_trials": 200
+})
+```
+
+### 3. Profile a Triton Kernel
+
+```python
+# Triton kernel with explicit inputs
+response = requests.post("http://localhost:8000/evaluate", json={
+    "kernel": {
+        "source_code": """
+import triton
+import triton.language as tl
+
+@triton.jit
+def vector_add(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    tl.store(output_ptr + offsets, x + y, mask=mask)
+""",
+        "kernel_type": "triton",
+        "io": {
+            "args": [
+                {"name": "x", "type": "tensor", "tensor_spec": {"shape": [1024], "dtype": "float32", "init": {"kind": "randn", "seed": 42}}, "role": "input"},
+                {"name": "y", "type": "tensor", "tensor_spec": {"shape": [1024], "dtype": "float32", "init": {"kind": "randn", "seed": 43}}, "role": "input"},
+                {"name": "output", "type": "tensor", "tensor_spec": {"shape": [1024], "dtype": "float32"}, "role": "output"},
+                {"name": "n_elements", "type": "int", "value": 1024, "role": "input"},
+                {"name": "BLOCK_SIZE", "type": "int", "value": 256, "role": "input", "is_meta": true}
+            ],
+            "launch": {"grid": {"x": 4}, "num_warps": 4}
+        }
+    },
+    "num_trials": 100
+})
+```
+
+For more examples and advanced usage, see [API_GUIDE.md](API_GUIDE.md).
+
+## Additional Endpoints
 
 ### Health Check
-
 ```bash
 curl http://localhost:8000/health
 ```
 
-### Additional Endpoints
-
+### Job Status
 ```bash
-# Get job status
 curl http://localhost:8000/job/{job_id}
+```
 
-# Get server statistics
+### Server Statistics
+```bash
 curl http://localhost:8000/stats
+```
 
-# Admin: Cleanup old jobs
+### Admin: Cleanup Old Jobs
+```bash
 curl -X POST http://localhost:8000/admin/cleanup-jobs
 ```
-
-## Device Metrics Collection
-
-The server supports NCU profiling for detailed GPU performance analysis:
-
-```bash
-# Enable device metrics
-export ENABLE_DEVICE_METRICS=true
-
-# Configure NCU sections
-export NCU_SECTIONS="SpeedOfLight,Occupancy,ComputeWorkloadAnalysis"
-
-# Run server with metrics
-python main.py
-```
-
-See [DEVICE_METRICS_GUIDE.md](DEVICE_METRICS_GUIDE.md) for detailed documentation.
-
-## Compilation Backends
-
-The server uses a backend pattern for compilation, allowing different approaches for different kernel types:
-
-### TorchCudaCompilationBackend
-- Handles PyTorch models with embedded CUDA (using `load_inline`)
-- Extracts CUDA kernels and C++ wrappers
-- Transforms C++ code for compatibility
-- Compiles using PyTorch's torch.utils.cpp_extension
-
-### TorchCompilationBackend
-- Handles pure PyTorch reference models
-- Direct execution without compilation
-- Used for baseline performance comparison
-
-### TritonCompilationBackend
-- Handles Triton kernel implementations
-- Supports runtime capture and IOContract-based execution
-- Manages Triton-specific meta parameters and grid configurations
-
-### Adding New Backends
-
-To add support for new kernel types:
-
-1. Create a new backend class inheriting from `BaseCompilationBackend`
-2. Implement the `compile()` method
-3. Register in `CompilationService.backends`
-
-## Subprocess Isolation
-
-The server uses subprocess workers for safety:
-- Kernel compilation and validation run in isolated processes
-- Segfaults and crashes don't affect the main server
-- GPU resources properly managed across processes
-- Log streaming from subprocess to main process
-
-## Project Structure
-
-```
-cuda_eval_server_v2/
-├── app.py                          # FastAPI frontend
-├── main.py                         # Entry point
-├── subprocess_worker.py            # Isolated execution worker
-├── orchestration/
-│   └── job_manager.py             # Job orchestration
-├── compilation/
-│   ├── compiler_service.py        # Backend-based compilation
-│   ├── base_compiler.py           # Base backend interface
-│   ├── torch/                     # Pure PyTorch backend
-│   │   └── torch_backend.py
-│   ├── torch_cuda/                # PyTorch+CUDA backend
-│   │   ├── torch_cuda_backend.py
-│   │   ├── compiler.py
-│   │   ├── kernel_extractor.py
-│   │   └── cpp_wrapper_transformer.py
-│   └── triton/                    # Triton backend
-│       └── triton_backend.py
-├── validation/
-│   ├── base_validator.py          # Validation interface
-│   └── torch_cuda_validator.py    # TORCH_CUDA validation
-├── profiling/
-│   └── kernel_profiler.py         # Performance profiling
-└── shared/
-    ├── models.py                   # Data models with IOContract
-    ├── utils.py                    # Tensor encoding/decoding utilities
-    ├── executable_kernels.py       # Kernel execution abstraction
-    ├── args_generator.py           # Input generation
-    ├── device_metrics_parser.py    # NCU metrics parsing
-    └── metrics_collector.py        # Performance metrics
-```
-
-## Performance Comparison
-
-| Component | Old Architecture | New Architecture |
-|-----------|-----------------|------------------|
-| **Design** | CuPy-centric | Strategy pattern |
-| **Kernel Types** | CUDA only | Multiple types |
-| **Compilation** | Single approach | Pluggable strategies |
-| **Safety** | In-process | Subprocess isolation |
-| **Extensibility** | Limited | Highly extensible |
-| **API** | Simple strings | Typed kernel objects |
-
-## Migration from V1
-
-The server maintains backward compatibility with the V1 API while offering enhanced functionality through the new API. See the API Usage section for examples of both formats.
-
-### Key Changes
-
-1. **API Format**: Now uses `KernelCode` objects with explicit `kernel_type`
-2. **Compilation**: Strategy-based instead of CuPy-only
-3. **File Names**: Several modules renamed (see migration table below)
-
-| Old Name | New Name/Location |
-|----------|-------------------|
-| `simple_cupy_compiler.py` | Use compilation strategies |
-| `separated_profiler.py` | `profiling/kernel_profiler.py` |
-| `input_generator.py` | `shared/args_generator.py` |
-| `subprocess_correctness_validator.py` | `validation/torch_cuda_validator.py` |
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Import Errors**
-   ```
-   ModuleNotFoundError: No module named 'compilation'
-   ```
-   Solution: Ensure you're running from the correct directory
+| Problem | Symptom | Solution |
+|---------|---------|----------|
+| GPU not found | `"gpu_available": false` | Check CUDA installation with `nvidia-smi` |
+| Compilation failed | `"compiled": false` | Check `compilation_error` field in response |
+| Timeout | Request hangs | Increase `timeout` parameter (max: 600) |
+| Port in use | Server won't start | Change port: `python main.py --port 8001` |
+| Out of memory | CUDA OOM error | Reduce tensor sizes or batch size |
+| Wrong results | `"correctness": false` | Check `validation_error`, verify algorithm |
 
-2. **Kernel Type Not Supported**
-   ```
-   ValueError: No compilation strategy available for kernel type
-   ```
-   Solution: Check that kernel_type is one of: torch, torch_cuda, cuda, triton
+### Debug Mode
 
-3. **Subprocess Failures**
-   ```
-   Subprocess completed with exit code 1
-   ```
-   Solution: Check subprocess worker logs for detailed error messages
+```bash
+# Enable debug logging
+LOG_LEVEL=DEBUG python main.py
 
-4. **GPU Resource Issues**
-   ```
-   TimeoutError: No GPU available within 300 seconds
-   ```
-   Solution: Check GPU availability with `nvidia-smi`
+# Enable device metrics (NCU profiling)
+ENABLE_DEVICE_METRICS=true python main.py
 
-## Future Enhancements
+# View detailed logs
+tail -f logs/cuda_eval_server.log
+```
 
-- [ ] Add CUDA compilation strategy for raw CUDA kernels
-- [ ] Add Triton compilation strategy
-- [ ] Implement compilation caching across requests
-- [ ] Add distributed evaluation support
-- [ ] Enhanced metrics dashboard
+## Configuration
 
-## Contributing
+### Environment Variables
 
-1. **Add Strategies**: Extend `BaseCompilationStrategy` for new kernel types
-2. **Add Validators**: Extend `BaseValidator` for validation logic
-3. **Maintain API**: Keep backward compatibility when possible
-4. **Add Tests**: Test each component independently
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GPU_DEVICE` | GPU device ID to use | 0 |
+| `MAX_WORKERS` | Parallel subprocess workers | 4 |
+| `ENABLE_DEVICE_METRICS` | Enable NCU profiling | false |
+| `LOG_LEVEL` | Logging verbosity | INFO |
+| `PORT` | Server port | 8000 |
+| `HOST` | Server host | 0.0.0.0 |
 
----
+### Performance Tuning
 
-**Production Ready**: The server provides a flexible, extensible architecture for evaluating various kernel types with robust error handling and performance profiling.
+- **Trial Count**: More trials = more accurate results (recommended: 100-1000)
+- **Timeout**: Set based on kernel complexity (default: 120s, max: 600s)
+- **Memory**: Server uses ~2GB base + kernel requirements
+- **Overhead**: Typically 10-50ms per evaluation
+
+## Advanced Features
+
+### IOContract for Reproducible Testing
+Specify exact inputs and outputs for deterministic testing. Required for Triton and CUDA kernels.
+
+### Device Metrics with NCU
+Enable detailed GPU profiling with NVIDIA Nsight Compute:
+```bash
+ENABLE_DEVICE_METRICS=true python main.py
+```
+
+### Function Targeting
+Test specific functions within your code:
+```python
+"metadata": {
+    "function_name": "optimized_softmax"  # Target specific function
+}
+```
+
+### Multi-Kernel Support
+CUDA files can contain multiple kernels with runtime selection.
+
+For detailed documentation on these features, see [API_GUIDE.md](API_GUIDE.md).
+
+## Architecture Overview
+
+The server uses a modular architecture with pluggable backends:
+
+```
+Request → FastAPI → Job Manager → Subprocess Worker
+                                    ↓
+                            Compilation Backend
+                            (Torch/CUDA/Triton)
+                                    ↓
+                            Validation & Profiling
+                                    ↓
+                                Response
+```
+
+Key design decisions:
+- **Subprocess Isolation**: Prevents kernel crashes from affecting the server
+- **Backend Pattern**: Easy to add support for new kernel types
+- **Async Processing**: Non-blocking request handling
+- **Statistical Profiling**: Multiple trials with percentile analysis
+
+For implementation details, see [USER_MANUAL.md](USER_MANUAL.md).
+
+## Development
+
+### Project Structure
+
+```
+cuda_eval_server_v2/
+├── app.py                    # FastAPI application
+├── main.py                   # Entry point
+├── subprocess_worker.py      # Isolated execution
+├── orchestration/           # Job management
+├── compilation/             # Kernel compilation backends
+│   ├── torch/              # PyTorch backend
+│   ├── torch_cuda/         # PyTorch+CUDA backend
+│   ├── triton/             # Triton backend
+│   └── cuda/               # Raw CUDA backend
+├── validation/              # Correctness validation
+├── profiling/               # Performance profiling
+└── shared/                  # Common utilities
+```
+
+### Running Tests
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test
+pytest tests/test_torch_backend.py
+
+# Run with coverage
+pytest --cov=. tests/
+```
+
+### Adding New Kernel Types
+
+1. Create a new backend in `compilation/`
+2. Inherit from `BaseCompilationBackend`
+3. Implement `compile()` method
+4. Register in `CompilationService`
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+## Related Documentation
+
+- [API_GUIDE.md](API_GUIDE.md) - Complete API reference with examples
+- [USER_MANUAL.md](USER_MANUAL.md) - System design and implementation details
+- [DEVICE_METRICS_GUIDE.md](DEVICE_METRICS_GUIDE.md) - GPU profiling with NCU
+- [examples/](examples/) - Sample kernels and use cases
+- [CONTRIBUTING.md](CONTRIBUTING.md) - How to contribute
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.

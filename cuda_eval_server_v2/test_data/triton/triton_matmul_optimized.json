@@ -1,0 +1,165 @@
+{
+  "ref_kernel": {
+    "source_code": "\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, a, b):\n        return torch.matmul(a, b)\n\ndef get_init_inputs():\n    return []\n\ndef get_inputs():\n    return []\n",
+    "kernel_type": "torch",
+    "io": {
+      "args": [
+        {
+          "name": "a",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              64,
+              128
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 0
+            }
+          }
+        },
+        {
+          "name": "b",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              128,
+              256
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  "custom_kernel": {
+    "source_code": "\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef matmul_kernel(\n    a_ptr, b_ptr, c_ptr,\n    M, N, K,\n    stride_am, stride_ak,\n    stride_bk, stride_bn,\n    stride_cm, stride_cn,\n    BLOCK_SIZE_M: tl.constexpr,\n    BLOCK_SIZE_N: tl.constexpr,\n    BLOCK_SIZE_K: tl.constexpr,\n):\n    pid_m = tl.program_id(axis=0)\n    pid_n = tl.program_id(axis=1)\n\n    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\n    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\n    offs_k = tl.arange(0, BLOCK_SIZE_K)\n\n    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)\n\n    for k in range(0, K, BLOCK_SIZE_K):\n        a_ptrs = a_ptr + (offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak)\n        a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)\n        a = tl.load(a_ptrs, mask=a_mask, other=0.0)\n\n        b_ptrs = b_ptr + ((k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn)\n        b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)\n        b = tl.load(b_ptrs, mask=b_mask, other=0.0)\n\n        accumulator += tl.dot(a, b)\n\n    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)\n    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)\n    tl.store(c_ptrs, accumulator, mask=c_mask)\n",
+    "kernel_type": "triton",
+    "io": {
+      "args": [
+        {
+          "name": "a_ptr",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              64,
+              128
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 0
+            }
+          }
+        },
+        {
+          "name": "b_ptr",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              128,
+              256
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 1
+            }
+          }
+        },
+        {
+          "name": "c_ptr",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [
+              64,
+              256
+            ],
+            "dtype": "float32"
+          }
+        },
+        {
+          "name": "M",
+          "type": "int",
+          "value": 64
+        },
+        {
+          "name": "N",
+          "type": "int",
+          "value": 256
+        },
+        {
+          "name": "K",
+          "type": "int",
+          "value": 128
+        },
+        {
+          "name": "stride_am",
+          "type": "int",
+          "value": 128
+        },
+        {
+          "name": "stride_ak",
+          "type": "int",
+          "value": 1
+        },
+        {
+          "name": "stride_bk",
+          "type": "int",
+          "value": 256
+        },
+        {
+          "name": "stride_bn",
+          "type": "int",
+          "value": 1
+        },
+        {
+          "name": "stride_cm",
+          "type": "int",
+          "value": 256
+        },
+        {
+          "name": "stride_cn",
+          "type": "int",
+          "value": 1
+        },
+        {
+          "name": "BLOCK_SIZE_M",
+          "type": "int",
+          "value": 32,
+          "is_meta": true
+        },
+        {
+          "name": "BLOCK_SIZE_N",
+          "type": "int",
+          "value": 32,
+          "is_meta": true
+        },
+        {
+          "name": "BLOCK_SIZE_K",
+          "type": "int",
+          "value": 32,
+          "is_meta": true
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 2,
+          "y": 8,
+          "z": 1
+        }
+      }
+    }
+  },
+  "num_trials": 10
+}

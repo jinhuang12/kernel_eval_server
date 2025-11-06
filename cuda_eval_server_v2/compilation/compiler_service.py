@@ -12,6 +12,8 @@ from compilation.base_compiler import BaseCompilationBackend
 from compilation.torch_cuda.torch_cuda_backend import TorchCudaCompilationBackend
 from compilation.torch.torch_backend import TorchCompilationBackend
 from compilation.triton.triton_backend import TritonCompilationBackend
+from compilation.cuda.cuda_backend import CudaCompilationBackend
+from compilation.multi_kernel.multi_kernel_backend import MultiKernelCompilationBackend
 from shared.models import BaseExecutableKernel, CompilationRequest, CompilationResult, KernelType
 from shared.metrics_collector import get_metrics_collector
 
@@ -40,7 +42,8 @@ class CompilationService:
             KernelType.TORCH_CUDA: TorchCudaCompilationBackend(cache_dir),
             KernelType.TORCH: TorchCompilationBackend(),
             KernelType.TRITON: TritonCompilationBackend(),
-            # KernelType.CUDA: CudaCompilationStrategy(cache_dir),  # Future
+            KernelType.CUDA: CudaCompilationBackend(cache_dir),
+            KernelType.MULTI_KERNEL: MultiKernelCompilationBackend(),
         }
     
     def compile_kernel(self, request: CompilationRequest, gpu_id: Optional[int] = None) -> CompilationResult:
@@ -92,7 +95,7 @@ class CompilationService:
             
             return CompilationResult(
                 compiles=False,
-                error=f"Compilation error: {str(e)}",
+                error=f"Compilation error:\n{traceback.format_exc()}",
                 compilation_time=compilation_time
             )
     

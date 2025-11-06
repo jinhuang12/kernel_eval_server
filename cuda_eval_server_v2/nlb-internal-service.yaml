@@ -1,0 +1,34 @@
+# Internal Network Load Balancer Service for CUDA Evaluation Server
+# Provides secure internal access via kubectl port-forward
+apiVersion: v1
+kind: Service
+metadata:
+  name: cuda-eval-nlb-internal
+  namespace: hyperpod-ns-silverhand
+  labels:
+    app: cuda-eval-server-v2
+    service-type: nlb-internal
+  annotations:
+    # Network Load Balancer configuration
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    # Internal scheme - only accessible within VPC
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+    # Cross-zone load balancing for better availability
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    # Health check configuration
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: "/health"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "30"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-timeout: "10"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "2"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "2"
+spec:
+  type: LoadBalancer
+  selector:
+    app: cuda-eval-server-v2
+    gpu-type: a100
+  ports:
+  - name: http
+    port: 8000        # Port exposed by the load balancer
+    targetPort: 8000  # Port on the container
+    protocol: TCP
+  sessionAffinity: None  # Round-robin load balancing

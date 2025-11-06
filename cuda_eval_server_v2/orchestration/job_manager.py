@@ -10,13 +10,16 @@ import logging
 import json
 import os
 import sys
-import tempfile
 import subprocess
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Union
 
 from shared.models import (
+    CompareRequest, CompareResponse, JobState, 
     EvaluationRequest, EvaluationResponse, JobState,
-    CompilationResult, ProfilingResult, ArgSpec, TensorSpec, ValidationResult
+    KernelType, CompilationResult, ValidationResult,
+    CompareProfilingResult, ProfilingResult,
+    ArgSpec, TensorSpec,
+    RuntimeStats, KernelExecutionResult, KernelMetadata, DeviceMetrics, ComparisonDeviceMetrics
 )
 from shared.utils import HOSTNAME, IP_ADDRESS, create_error_response
 from shared.metrics_collector import get_metrics_collector
@@ -35,18 +38,18 @@ class JobManager:
     def __init__(self):
         # Only GPU manager stays in main process
         self.gpu_manager = GPUResourceManager()
-        
+
         self.jobs: Dict[str, JobState] = {}
         self.metrics_collector = get_metrics_collector()
         
         logger.info("JobManager initialized with subprocess-based evaluation")
     
-    async def submit_evaluation_job(self, request: EvaluationRequest) -> str:
+    async def submit_evaluation_job(self, request: Union[EvaluationRequest, CompareRequest]) -> str:
         """
         Submit a new evaluation job and start async processing
         
         Args:
-            request: EvaluationRequest with ref_code and custom_code
+            request: EvaluationRequest
             
         Returns:
             job_id: Unique identifier for tracking the job
@@ -77,7 +80,7 @@ class JobManager:
         """Get current job status"""
         return self.jobs.get(job_id)
     
-    async def wait_for_completion(self, job_id: str, timeout: int = 120) -> Optional[EvaluationResponse]:
+    async def wait_for_completion(self, job_id: str, timeout: int = 120) -> Optional[Union[EvaluationResponse, CompareResponse]]:
         """
         Wait for job completion with timeout
         
@@ -140,25 +143,26 @@ class JobManager:
         report_path = f"/tmp/ncu_{job_id}.ncu-rep"
         
         # Build NCU command
-        ncu_cmd = ["sudo", "-E"] + env_vars + [ncu_path]
+        ncu_cmd = [ncu_path]
         ncu_cmd.extend([
             "--export", report_path,
             "--nvtx",
+            "--set", "full",
             "--nvtx-include", f"{job_id}_original/",
             "--nvtx-include", f"{job_id}_custom/",
-            "--target-processes", "all",
+            "--target-processes", "application-only", # Needs to be application only in docker container
             "--force-overwrite"
         ])
         
         # Add sections if specified
-        ncu_sections = os.getenv("NCU_SECTIONS", "SpeedOfLight,Occupancy,ComputeWorkloadAnalysis,MemoryWorkloadAnalysis")
+        ncu_sections = os.getenv("NCU_SECTIONS", "SpeedOfLight,Occupancy,ComputeWorkloadAnalysis,MemoryWorkloadAnalysis,LaunchStats,SchedulerStats,WarpStateStats,SourceCounters,SpeedOfLight_RooflineChart")
         if ncu_sections:
             for section in ncu_sections.split(","):
                 ncu_cmd.extend(["--section", section.strip()])
         
         return ncu_cmd
     
-    def _prepare_subprocess_data(self, request: EvaluationRequest, job_id: str, gpu_id: int, created_at: float) -> Dict[str, Any]:
+    def _prepare_subprocess_data(self, request: Any, job_id: str, gpu_id: int, created_at: float, job_type: str = "comparison") -> Dict[str, Any]:
         """Prepare data for subprocess worker"""
         # Use Pydantic v1 compatible serialization
         try:
@@ -173,6 +177,7 @@ class JobManager:
             "job_id": job_id,
             "gpu_id": gpu_id,
             "created_at": created_at,
+            "job_type": job_type,
             "server_path": os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         })
         
@@ -229,24 +234,50 @@ class JobManager:
         
         logger.info(f"Job {job_id}: Subprocess completed with exit code {returncode}")
         
-        # Read result from temp file
+        # Always try to read result from temp file, even on crash
         result_file = f"/tmp/job_{job_id}_result.json"
+        result = None
+        
         if os.path.exists(result_file):
-            with open(result_file, 'r') as f:
-                result = json.load(f)
-            
-            # Cleanup temp files
             try:
+                with open(result_file, 'r') as f:
+                    result = json.load(f)
+                logger.info(f"Job {job_id}: Successfully read result file with status: {result.get('status', 'unknown')}")
+            except Exception as e:
+                logger.error(f"Job {job_id}: Failed to read result file: {e}")
+        
+        # Cleanup temp files
+        try:
+            if os.path.exists(input_file):
                 os.unlink(input_file)
+            if os.path.exists(result_file):
                 os.unlink(result_file)
-            except OSError:
-                pass
-            
+        except OSError as e:
+            logger.warning(f"Job {job_id}: Failed to cleanup temp files: {e}")
+        
+        # If we got a result (even partial), return it
+        if result:
+            # If subprocess crashed but we have partial results, mark as completed
+            # The partial results will be used to build the response
+            if returncode != 0 and result.get("status") not in ["completed", "failed"]:
+                logger.warning(f"Job {job_id}: Subprocess crashed (exit code {returncode}) but partial results available")
+                result["status"] = "completed"  # Mark as completed so we return partial results
+                if not result.get("error"):
+                    result["error"] = f"Subprocess terminated unexpectedly (exit code: {returncode})"
             return result
         else:
+            # No result file at all - complete failure
+            error_msg = f"Subprocess failed with exit code {returncode}"
+            if returncode == -9:
+                error_msg = "Subprocess was killed (possibly OOM or timeout)"
+            elif returncode == -15:
+                error_msg = "Subprocess was terminated"
+            elif returncode == 1:
+                error_msg = "Subprocess failed during initialization"
+            
             return {
                 "status": "failed",
-                "error": f"No result file found, subprocess exit code: {returncode}"
+                "error": error_msg
             }
     
     async def _process_evaluation_job(self, job_id: str):
@@ -262,14 +293,15 @@ class JobManager:
         try:
             job_state = self.jobs[job_id]
             request = job_state.request
+            job_type = "comparison" if isinstance(request, CompareRequest) else "evaluation"
             
             # Acquire GPU in main process
             async with self.gpu_manager.acquire_gpu(job_id=job_id) as gpu_id:
-                logger.info(f"Job {job_id}: Acquired GPU {gpu_id}")
+                logger.info(f"Comparison job {job_id}: Acquired GPU {gpu_id}")
                 
                 # Prepare subprocess data
                 subprocess_data = self._prepare_subprocess_data(
-                    request, job_id, gpu_id, job_state.created_at
+                    request, job_id, gpu_id, job_state.created_at, job_type
                 )
                 
                 # Run subprocess worker
@@ -288,53 +320,99 @@ class JobManager:
                       
                 # Reconstruct ProfilingResult from subprocess result
                 if result.get("profiling_result"):
-                    job_state.profiling_result = ProfilingResult(**result["profiling_result"])
+                    job_state.profiling_result = CompareProfilingResult(**result["profiling_result"]) \
+                        if job_type == "comparison" else ProfilingResult(**result["profiling_result"])
 
                 if job_state.status == "failed":
                     job_state.error = result.get("error", "Subprocess execution failed")
-                    logger.error(f"Job {job_id}: Failed - {job_state.error}")  
-                    return          
+                    logger.error(f"Job {job_id}: Failed - {job_state.error}")
+                    # Don't return early - we still want to create a response
+                    # Set status to completed since we're returning a result
+                    job_state.status = "completed"
                 
-                # Create final EvaluationResponse
+                # Create final EvaluationResponse - handle all cases including compilation/validation failures
+                # Build metadata first
+                metadata = KernelMetadata(gpu_id=gpu_id)
+                if job_state.profiling_result and job_state.profiling_result.metadata:
+                    # Add any additional metadata from profiling
+                    for key, value in job_state.profiling_result.metadata.items():
+                        if key == "kernel_name":
+                            metadata.kernel_name = value
+                        elif key == "kernel_type":
+                            metadata.kernel_type = value
+                        elif key == "gpu_type":
+                            metadata.gpu_type = value
+                        elif key == "cuda_version":
+                            metadata.cuda_version = value
+                
+                # Extract device metrics if available
+                device_metrics_parser = DeviceMetricsParser(f"/tmp/ncu_{job_id}.ncu-rep")
+                if device_metrics_parser and device_metrics_parser.is_available() and job_id:
+                    logger.info("Step 4: Extracting device metrics from NCU report")
+                    try:
+                        device_metrics_dict = device_metrics_parser.get_metrics_for_request(job_id)
+                        if device_metrics_dict:
+                            # Check if this is a comparison metrics structure or single metrics
+                            if "original_device_metrics" in device_metrics_dict or "custom_device_metrics" in device_metrics_dict:
+                                # Comparison metrics - use ComparisonDeviceMetrics
+                                metadata.device_metrics = ComparisonDeviceMetrics.from_dict(device_metrics_dict)
+                            else:
+                                # Single kernel metrics - use DeviceMetrics
+                                metadata.device_metrics = DeviceMetrics.from_dict(device_metrics_dict)
+                        else:
+                            logger.warning(f"No device metrics found for job {job_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to extract device metrics: {e}")
+                
+                # Build RuntimeStats if profiling succeeded
+                runtime_stats = None
+                runtime = 0.0
                 if job_state.profiling_result and job_state.profiling_result.success:
-                    kernel_exec_result = {
-                        "compiled": True,
-                        "correctness": job_state.validation_result.is_correct,
-                        "runtime": job_state.profiling_result.custom_runtime.get("mean", 0) if job_state.profiling_result.custom_runtime else 0,
-                        "runtime_stats": job_state.profiling_result.custom_runtime,
-                        "metadata": job_state.profiling_result.metadata or {}
-                    }
-
-                    # Ensure GPU ID is included
-                    if "metadata" not in kernel_exec_result:
-                        kernel_exec_result["metadata"] = {}
-                    kernel_exec_result["metadata"]["gpu_id"] = gpu_id
-
-                    # Extract device metrics if available
-                    device_metrics = {}
-                    device_metrics_parser = DeviceMetricsParser(f"/tmp/ncu_{job_id}.ncu-rep")
-                    if device_metrics_parser and device_metrics_parser.is_available() and job_id:
-                        logger.info("Step 4: Extracting device metrics from NCU report")
-                        try:
-                            device_metrics = device_metrics_parser.get_metrics_for_request(job_id)
-                            if not device_metrics:
-                                logger.warning(f"No device metrics found for job {job_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to extract device metrics: {e}")
-                    # Add device metrics to metadata if available
-                    if device_metrics:
-                        kernel_exec_result["metadata"]["device_metrics"] = device_metrics
+                    if job_type == "comparison":
+                        stats_dict = job_state.profiling_result.custom_runtime
+                    else:
+                        stats_dict = job_state.profiling_result.runtime_stats
                     
+                    if stats_dict:
+                        runtime = stats_dict.get("mean", 0.0)
+                        runtime_stats = RuntimeStats.from_dict(stats_dict)
+                
+                # Create KernelExecutionResult
+                kernel_exec_result = KernelExecutionResult(
+                    compiled=job_state.compilation_result.compiles if job_state.compilation_result else False,
+                    correctness=job_state.validation_result.is_correct if job_state.validation_result else False,
+                    runtime=runtime,
+                    metadata=metadata,
+                    runtime_stats=runtime_stats,
+                    compilation_error=job_state.compilation_result.error if job_state.compilation_result and not job_state.compilation_result.compiles else None,
+                    validation_error=job_state.validation_result.error if job_state.validation_result and not job_state.validation_result.is_correct else None
+                )
+                
+                # Create response - always return a response even if compilation/validation failed
+                if job_type == "comparison":
+                    # Build RuntimeStats for reference kernel
+                    ref_runtime = RuntimeStats(mean=0, std=0, min=0, max=0, median=0)
+                    if job_state.profiling_result and job_state.profiling_result.original_runtime:
+                        ref_runtime = RuntimeStats.from_dict(job_state.profiling_result.original_runtime)
+                    
+                    job_state.result = CompareResponse(
+                        job_id=job_id,
+                        kernel_exec_result=kernel_exec_result,
+                        ref_runtime=ref_runtime,
+                        pod_name=HOSTNAME,
+                        pod_ip=IP_ADDRESS,
+                        status="success"  # Job completed successfully even if kernel failed
+                    )
+                else:
                     job_state.result = EvaluationResponse(
                         job_id=job_id,
                         kernel_exec_result=kernel_exec_result,
-                        ref_runtime=job_state.profiling_result.original_runtime or {},
                         pod_name=HOSTNAME,
                         pod_ip=IP_ADDRESS,
-                        status="success"
+                        status="success"  # Job completed successfully even if kernel failed
                     )
-                    success = True
-                    logger.info(f"Job {job_id}: Completed successfully")    
+                success = True
+                logger.info(f"Job {job_id}: Completed with compiled={kernel_exec_result.compiled}, correctness={kernel_exec_result.correctness}")    
         except Exception as e:
             logger.error(f"Job {job_id}: Unexpected error - {e}")
             job_state = self.jobs.get(job_id)

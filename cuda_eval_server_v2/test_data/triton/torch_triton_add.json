@@ -1,0 +1,107 @@
+{
+  "ref_kernel": {
+    "source_code": "\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, x, y):\n        return x + y\n\ndef get_init_inputs():\n    return []\n\ndef get_inputs():\n    return []\n",
+    "kernel_type": "torch",
+    "io": {
+      "args": [
+        {
+          "name": "x",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              16
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "ones"
+            }
+          }
+        },
+        {
+          "name": "y",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              16
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "full",
+              "fill_value": 2.0
+            }
+          }
+        }
+      ]
+    }
+  },
+  "custom_kernel": {
+    "source_code": "\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):\n    pid = tl.program_id(axis=0)\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    mask = offsets < n_elements\n    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)\n    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)\n    output = x + y\n    tl.store(output_ptr + offsets, output, mask=mask)\n",
+    "kernel_type": "triton",
+    "io": {
+      "args": [
+        {
+          "name": "x_ptr",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              16
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "ones"
+            }
+          }
+        },
+        {
+          "name": "y_ptr",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [
+              16
+            ],
+            "dtype": "float32",
+            "init": {
+              "kind": "full",
+              "fill_value": 2.0
+            }
+          }
+        },
+        {
+          "name": "output_ptr",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [
+              16
+            ],
+            "dtype": "float32"
+          }
+        },
+        {
+          "name": "n_elements",
+          "type": "int",
+          "value": 16
+        },
+        {
+          "name": "BLOCK_SIZE",
+          "type": "int",
+          "value": 16,
+          "is_meta": true
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 1,
+          "y": 1,
+          "z": 1
+        },
+        "num_warps": 4
+      }
+    }
+  },
+  "num_trials": 10
+}

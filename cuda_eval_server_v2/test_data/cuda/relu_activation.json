@@ -1,0 +1,79 @@
+{
+  "ref_kernel": {
+    "source_code": "\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, x):\n        return torch.nn.functional.relu(x)\n",
+    "kernel_type": "torch",
+    "io": {
+      "args": [
+        {
+          "name": "x",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [2048, 2048],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            }
+          }
+        }
+      ]
+    }
+  },
+  "custom_kernel": {
+    "source_code": "__global__ void relu_activation(float* input, float* output, int n_elements) {\n    int tid = blockIdx.x * blockDim.x + threadIdx.x;\n    if (tid < n_elements) {\n        output[tid] = fmaxf(input[tid], 0.0f);\n    }\n}",
+    "kernel_type": "cuda",
+    "io": {
+      "args": [
+        {
+          "name": "input",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [2048, 2048],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            }
+          }
+        },
+        {
+          "name": "output",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [2048, 2048],
+            "dtype": "float32",
+            "init": {
+              "kind": "zeros"
+            }
+          }
+        },
+        {
+          "name": "n_elements",
+          "type": "int",
+          "role": "input",
+          "value": 4194304
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 4096,
+          "y": 1,
+          "z": 1
+        },
+        "block": {
+          "x": 1024,
+          "y": 1,
+          "z": 1
+        }
+      }
+    },
+    "metadata": {
+      "kernel_name": "relu_activation"
+    }
+  },
+  "num_trials": 10,
+  "timeout": 120
+}

@@ -171,7 +171,7 @@ class TorchCudaCupyCompiler:
             
             # Step 2: Compile transformed wrapper with load_inline
             # Ensure build directory exists
-            build_dir = os.path.join(self.cache_dir, "cpp_wrapper_cache")
+            build_dir = os.path.join(self.cache_dir, kernel.hash)
             os.makedirs(build_dir, exist_ok=True)
             
             cpp_extension = load_inline(

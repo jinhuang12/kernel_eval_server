@@ -1,0 +1,10 @@
+# Requirements File Location
+
+The requirements file for CUDA Evaluation Server V2 has been moved to:
+../../../requirements.eval_server_v2.txt
+
+To install dependencies:
+pip install -r ../../../requirements.eval_server_v2.txt
+
+Or from the AIRE-TFL-KernelBench directory:
+pip install -r requirements.eval_server_v2.txt

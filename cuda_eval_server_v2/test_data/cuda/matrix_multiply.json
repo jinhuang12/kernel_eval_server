@@ -1,0 +1,117 @@
+{
+  "ref_kernel": {
+    "source_code": "\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, A, B):\n        return torch.matmul(A, B)\n",
+    "kernel_type": "torch",
+    "io": {
+      "args": [
+        {
+          "name": "A",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [64, 128],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 0
+            }
+          }
+        },
+        {
+          "name": "B",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [128, 256],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  "custom_kernel": {
+    "source_code": "__global__ void matrix_multiply(float* A, float* B, float* C, int M, int N, int K) {\n    int row = blockIdx.y * blockDim.y + threadIdx.y;\n    int col = blockIdx.x * blockDim.x + threadIdx.x;\n    \n    if (row < M && col < N) {\n        float sum = 0.0f;\n        for (int k = 0; k < K; k++) {\n            sum += A[row * K + k] * B[k * N + col];\n        }\n        C[row * N + col] = sum;\n    }\n}",
+    "kernel_type": "cuda",
+    "io": {
+      "args": [
+        {
+          "name": "A",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [64, 128],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 0
+            }
+          }
+        },
+        {
+          "name": "B",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [128, 256],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 1
+            }
+          }
+        },
+        {
+          "name": "C",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [64, 256],
+            "dtype": "float32",
+            "init": {
+              "kind": "zeros"
+            }
+          }
+        },
+        {
+          "name": "M",
+          "type": "int",
+          "role": "input",
+          "value": 64
+        },
+        {
+          "name": "N",
+          "type": "int",
+          "role": "input",
+          "value": 256
+        },
+        {
+          "name": "K",
+          "type": "int",
+          "role": "input",
+          "value": 128
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 16,
+          "y": 4,
+          "z": 1
+        },
+        "block": {
+          "x": 16,
+          "y": 16,
+          "z": 1
+        }
+      }
+    },
+    "metadata": {
+      "kernel_name": "matrix_multiply"
+    }
+  },
+  "num_trials": 100,
+  "timeout": 30
+}

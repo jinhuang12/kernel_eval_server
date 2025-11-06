@@ -1,0 +1,71 @@
+{
+  "ref_kernel": {
+    "source_code": "\nimport torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    def __init__(self):\n        super().__init__()\n    \n    def forward(self, x):\n        return torch.nn.functional.gelu(x)\n",
+    "kernel_type": "torch",
+    "io": {
+      "args": [
+        {
+          "name": "x",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [1024, 1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            }
+          }
+        }
+      ]
+    }
+  },
+  "custom_kernel": {
+    "source_code": "\nimport torch\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef gelu_kernel_naive(\n    x_ptr, output_ptr,\n    n_elements,\n    BLOCK_SIZE: tl.constexpr,\n):\n    pid = tl.program_id(axis=0)\n    block_start = pid * BLOCK_SIZE\n    offsets = block_start + tl.arange(0, BLOCK_SIZE)\n    mask = offsets < n_elements\n    \n    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)\n    # GeLU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))\n    x3 = x * x * x\n    inner = 0.7978845608 * (x + 0.044715 * x3)\n    exp2x = tl.exp(2 * inner)\n    tanh = (exp2x - 1) / (exp2x + 1)\n    output = x * 0.5 * (1.0 + tanh)\n    tl.store(output_ptr + offsets, output, mask=mask)\n",
+    "kernel_type": "triton",
+    "io": {
+      "args": [
+        {
+          "name": "x_ptr",
+          "type": "tensor",
+          "role": "input",
+          "tensor_spec": {
+            "shape": [1024, 1024],
+            "dtype": "float32",
+            "init": {
+              "kind": "randn",
+              "seed": 42
+            }
+          }
+        },
+        {
+          "name": "output_ptr",
+          "type": "tensor",
+          "role": "output",
+          "tensor_spec": {
+            "shape": [1024, 1024],
+            "dtype": "float32"
+          }
+        },
+        {
+          "name": "n_elements",
+          "type": "int",
+          "value": 1048576
+        },
+        {
+          "name": "BLOCK_SIZE",
+          "type": "int",
+          "value": 1024,
+          "is_meta": true
+        }
+      ],
+      "launch": {
+        "grid": {
+          "x": 1024
+        }
+      }
+    }
+  },
+  "num_trials": 10,
+  "timeout": 120
+}

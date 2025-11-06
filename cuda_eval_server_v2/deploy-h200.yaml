@@ -1,0 +1,134 @@
+# H200 GPU Deployment for CUDA Evaluation Server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cuda-eval-server-v2-h200
+  labels:
+    app: cuda-eval-server-v2
+    gpu-type: h200
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cuda-eval-server-v2
+      gpu-type: h200
+  template:
+    metadata:
+      labels:
+        app: cuda-eval-server-v2
+        gpu-type: h200
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: ml.p5e.48xlarge
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      volumes:
+        - name: shmem
+          hostPath: 
+            path: /dev/shm
+        - name: local
+          hostPath:
+            path: /mnt/k8s-disks/0
+        - name: fsx-storage
+          persistentVolumeClaim:
+            claimName: fsx-claim  
+      containers:
+      - name: cuda-eval-server-v2
+        image: 592892253131.dkr.ecr.us-east-1.amazonaws.com/cuda-eval-server:latest
+        ports:
+        - containerPort: 8000
+        env:
+          # CUDA configuration - controls GPU visibility
+          - name: NVIDIA_DRIVER_CAPABILITIES
+            value: "compute,utility"  # GPU compute and nvidia-smi
+          # Python configuration
+          - name: PYTHONUNBUFFERED
+            value: "1"  # Ensures logs appear immediately (not buffered)
+          - name: PYTHONPATH
+            value: "/app:/app/KernelBench/scripts/cuda_eval_server_v2"  # Module search paths
+          # NCU (NVIDIA Nsight Compute) profiling configuration
+          - name: ENABLE_DEVICE_METRICS
+            value: "true"  # Enable detailed GPU profiling
+          # Server configuration
+          - name: LOG_LEVEL
+            value: "info"  # Logging verbosity (debug/info/warning/error)
+          # Pod information injected from Kubernetes metadata
+          # Useful for debugging and logging
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name  # Actual pod name (e.g., cuda-eval-server-v2-5d7b9c4d5-x2n4j)
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace  # Kubernetes namespace
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName  # Which EC2 instance pod is on  
+        resources:
+          requests:
+            nvidia.com/gpu: "8"
+            cpu: "96"
+            memory: "1024Gi"
+            vpc.amazonaws.com/efa: "32"
+          limits:
+            nvidia.com/gpu: "8"
+            cpu: "180"
+            memory: "1900Gi"
+            vpc.amazonaws.com/efa: "32"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        volumeMounts:
+          # Shared memory mount - critical for PyTorch/CUDA
+          - name: shmem
+            mountPath: /dev/shm  # Standard Linux shared memory path
+          
+          # Instance store NVMe - fastest available storage
+          - name: local-nvme
+            mountPath: /local  # Your app can use /local for temp files
+          
+          # FSx mount for shared data between pods
+          - name: fsx-storage
+            mountPath: /fsx  # Access shared filesystem at /fsx
+        
+        # Security context sets container security policies
+        securityContext:
+          allowPrivilegeEscalation: false  # Don't allow gaining privileges
+          runAsNonRoot: false  # NCU profiling requires root access
+          runAsUser: 0  # UID 0 = root (needed for GPU profiling)
+          seccompProfile:
+            type: Unconfined # Allows for NCU 
+          capabilities:
+            # Linux capabilities are fine-grained permissions
+            add:
+              - SYS_ADMIN  # Required for NCU to access GPU performance counters
+              - SYS_PTRACE  # Required for profiling other processes
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cuda-eval-service-h200
+  labels:
+    app: cuda-eval-server-v2
+    gpu-type: h200
+spec:
+  selector:
+    app: cuda-eval-server-v2
+    gpu-type: h200
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP

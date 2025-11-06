@@ -1,0 +1,38 @@
+# CUDA Evaluation Server V2 Requirements
+# Location: AIRE-TFL-KernelBench/requirements.eval_server_v2.txt
+
+# Core FastAPI dependencies
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+pydantic==2.10.6
+starlette==0.45.3
+
+# Additional FastAPI/Uvicorn dependencies
+httpx==0.28.1
+python-multipart==0.0.20
+websockets==15.0.1
+watchfiles==1.1.0
+httptools==0.6.4
+python-dotenv==1.1.1
+h11==0.14.0
+click==8.1.8
+PyYAML==6.0.2
+
+# Core ML/GPU dependencies
+torch==2.7.1
+cupy-cuda12x==13.4.1  # Use cupy-cuda12x for CUDA 12.x
+numpy==2.2.6
+triton==3.3.1
+
+# HTTP client for testing
+requests==2.32.3
+
+# MCP (Model Context Protocol) Server
+mcp==1.12.4
+
+# Development/Testing (optional)
+# pytest==8.x.x  # Uncomment if running tests
+
+# Note: ncu_report module comes with NCU installation at:
+# - Linux: /usr/local/cuda/NsightCompute-*/extras/python
+# - Ensure NCU is installed for device metrics collection

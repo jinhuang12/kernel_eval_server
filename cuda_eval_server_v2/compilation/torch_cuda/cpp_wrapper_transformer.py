@@ -15,7 +15,6 @@ class TorchCudaCppWrapperTransformer:
     
     def __init__(self):
         self.available = True  # Always available since no external dependencies
-        logger.info("Regex-based C++ wrapper transformer initialized")
     
     def transform_wrapper(self, cpp_source: str, function_name: str) -> Optional[str]:
         """

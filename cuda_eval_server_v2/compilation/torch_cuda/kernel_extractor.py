@@ -42,8 +42,8 @@ class TorchCudaExtractor:
             ExtractedKernel with CUDA source and metadata, or None if extraction fails
         """
         try:
-            logger.info(f"############### Custom Code #####################\n{source_code}\n")
-            logger.info(f"############### Custom Code End ##################")
+            logger.debug(f"############### Custom Code #####################\n{source_code}\n")
+            logger.debug(f"############### Custom Code End ##################")
             # Find load_inline calls
             load_inline_pattern = r'load_inline\s*\((.*?)\)'
             matches = list(re.finditer(load_inline_pattern, source_code, re.DOTALL))
@@ -109,7 +109,6 @@ class TorchCudaExtractor:
             
             # Extract C++ function signature from the wrapper
             cpp_function_name = cpp_functions[0]  # Use first function
-            cpp_signature = self._extract_cpp_function_signature(cpp_wrapper_source, cpp_function_name)
 
             # Extract torch module in generated code
             model_new_source = self._extract_model_new(source_code)

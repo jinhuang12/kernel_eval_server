@@ -245,7 +245,7 @@ class MetricsCollector:
         self.throughput_metrics = ThroughputMetrics()
         self._lock = threading.RLock()
         
-        logger.info("MetricsCollector initialized")
+        logger.debug("MetricsCollector initialized")
     
     # Compilation metrics
     def record_compilation_start(self, job_id: str):

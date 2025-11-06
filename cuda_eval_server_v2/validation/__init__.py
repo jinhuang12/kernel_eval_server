@@ -7,15 +7,16 @@ Provides subprocess isolation and kernel-type specific validators
 try:
     # Try relative imports first (for main process)
     from .base_validator import BaseKernelValidator
-    from .correctness_validator import CorrectnessValidator
+    from .correctness_validator import CorrectnessValidator, ExecutableValidator
 except ImportError:
     # Fall back to absolute imports (for subprocess)
     from validation.base_validator import BaseKernelValidator
-    from validation.correctness_validator import CorrectnessValidator
+    from validation.correctness_validator import CorrectnessValidator, ExecutableValidator
 
 
 __all__ = [
     'BaseKernelValidator',
-    'CorrectnessValidator', 
+    'CorrectnessValidator',
+    'ExecutableValidator', 
     'TorchValidator',
 ]

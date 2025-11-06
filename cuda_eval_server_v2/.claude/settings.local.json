@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh p5e-cmh \"pkill -f ''python3 main.py''\")",
+      "Bash(ssh p5e-cmh \"cd ~/AIRE-TFL-KernelBench/KernelBench/scripts/cuda_eval_server_v2 && python3 test_server_triton.py 2>&1 | head -80\")",
+      "Bash(ssh p5e-cmh \"lsof -i :8000 | grep LISTEN | awk ''{print $2}'' | xargs kill -9 2>/dev/null; sleep 1\")",
+      "Bash(ssh p5e-cmh \"cd ~/AIRE-TFL-KernelBench/KernelBench/scripts/cuda_eval_server_v2 && python3 test_server_triton.py 2>&1 | grep -E ''(SUCCESS|FAILED|Error:)'' | head -20\")",
+      "Bash(mkdir -p test_data/triton)",
+      "Bash(ssh p5e-cmh \"cd ~/AIRE-TFL-KernelBench/KernelBench/scripts/cuda_eval_server_v2 && python3 main.py\")",
+      "Bash(ssh p5e-cmh \"cd ~/AIRE-TFL-KernelBench/KernelBench/scripts/cuda_eval_server_v2 && lsof -i :8000 | grep LISTEN\")",
+      "Bash(ssh:*)",
+      "WebFetch(domain:*)",
+      "WebFetch(domain:aws.amazon.com)",
+      "WebFetch(domain:github.com)",
+      "Read(/Volumes/workplace/IronFist/src/AIRE-TFL-KernelBench/**)",
+      "Bash(curl:*)",
+      "Read(//Volumes/workplace/IronFist/src/AIRE-TFL-KernelBench/KernelBench/**)",
+      "Read(//Volumes/workplace/IronFist/src/AIRE-TFL-KernelBench/**)",
+      "Bash(chmod:*)",
+      "Bash(scp:*)",
+      "Bash(rsync:*)",
+      "Bash(python3:*)",
+      "mcp__fastmcp__SearchFastMcp"
+    ],
+    "deny": [],
+    "ask": [],
+    "defaultMode": "acceptEdits",
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

@@ -6,7 +6,7 @@ Extracts Speed of Light and other performance metrics from NCU profiling reports
 import logging
 import os
 import sys
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -16,6 +16,7 @@ NCU_REPORT_AVAILABLE = False
 try:
     # First try to find NCU installation and add ncu_report to path
     ncu_paths = [
+        "/opt/nvidia/nsight-compute/*/extras/python",
         "/usr/local/cuda/nsight-compute*/extras/python",
         "/usr/local/cuda/bin/"
     ]
@@ -25,7 +26,7 @@ try:
         import glob
         matches = glob.glob(path_pattern)
         if matches:
-            ncu_report_path = matches[0]  # Use first match
+            ncu_report_path = matches[-1]  # Use last match
             break
     
     if ncu_report_path:
@@ -38,6 +39,54 @@ try:
         
 except ImportError as e:
     logger.warning(f"Could not import ncu_report: {e} - device metrics will be unavailable")
+
+# -------------------------------
+# Helpers
+# -------------------------------
+
+def _metric_value(action, name: str) -> Tuple[Optional[float], Optional[str]]:
+    """Return (value, unit) if metric exists and is numeric, else (None, None)."""
+    try:
+        if name in action:
+            m = action[name]
+            v = m.value()
+            if isinstance(v, (int, float)):
+                try:
+                    unit = m.unit()  # may raise if units not exposed
+                except Exception:
+                    unit = None
+                return float(v), unit
+    except Exception as e:
+        logger.debug(f"Could not extract metric {name}: {e}")
+    return None, None
+
+
+def _to_seconds(val: float, unit: Optional[str]) -> Optional[float]:
+    """Convert a duration to seconds if unit is known; otherwise return None."""
+    if val is None:
+        return None
+    if not unit:
+        return None
+    u = unit.lower()
+    if u in ("s", "sec", "second", "seconds"):
+        return float(val)
+    if u in ("ms", "millisecond", "milliseconds"):
+        return float(val) / 1e3
+    if u in ("us", "µs", "microsecond", "microseconds"):
+        return float(val) / 1e6
+    if u in ("ns", "nanosecond", "nanoseconds"):
+        return float(val) / 1e9
+    # cycles and other units need device clocks; we skip conversion here
+    return None
+
+
+def _safe_div(n: Optional[float], d: Optional[float]) -> Optional[float]:
+    try:
+        if n is None or d is None or d == 0:
+            return None
+        return float(n) / float(d)
+    except Exception:
+        return None
 
 
 class DeviceMetricsParser:
@@ -170,6 +219,31 @@ class DeviceMetricsParser:
                     occupancy_metrics = self._extract_occupancy_metrics(action)
                     if occupancy_metrics:
                         metrics["occupancy_metrics"] = occupancy_metrics
+
+                    # NEW: Stall reasons (issue-side)
+                    stall_metrics = self._extract_stall_metrics(action)
+                    if stall_metrics:
+                        metrics["stall_metrics"] = stall_metrics
+
+                    # NEW: Scheduler signals (eligible vs issued, etc.)
+                    sched_metrics = self._extract_scheduler_metrics(action)
+                    if sched_metrics:
+                        metrics["scheduler_metrics"] = sched_metrics
+
+                    # NEW: Access-pattern diagnostics (coalescing, L2 over-fetch, bank conflicts)
+                    access_metrics = self._extract_access_pattern_metrics(action)
+                    if access_metrics:
+                        metrics["access_pattern_metrics"] = access_metrics
+
+                    # NEW: Roofline (AI, FLOP/s) where available
+                    roofline_metrics = self._extract_roofline_metrics(action, memory_metrics)
+                    if roofline_metrics:
+                        metrics["roofline_metrics"] = roofline_metrics
+
+                    # NEW: Timing/cycle context
+                    timing_metrics = self._extract_timing_metrics(action)
+                    if timing_metrics:
+                        metrics["timing_metrics"] = timing_metrics    
         
         except Exception as e:
             logger.error(f"Error extracting metrics for range {nvtx_range}: {e}")
@@ -421,6 +495,159 @@ class DeviceMetricsParser:
                 logger.debug(f"Could not extract occupancy metric {metric_name}: {e}")
         
         return occupancy
+    
+        # -------------------------------
+    # New extractors (added)
+    # -------------------------------
+
+    def _extract_stall_metrics(self, action) -> Dict[str, float]:
+        """Extract warp stall reasons (issue-side)."""
+        stalls: Dict[str, float] = {}
+        pairs = {
+            "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct": "stall_long_scoreboard_pct",
+            "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct": "stall_short_scoreboard_pct",
+            "smsp__warp_issue_stalled_barrier_per_warp_active.pct": "stall_barrier_pct",
+            "smsp__warp_issue_stalled_not_selected_per_warp_active.pct": "stall_not_selected_pct",
+        }
+        for m, k in pairs.items():
+            v, _ = _metric_value(action, m)
+            if v is not None:
+                stalls[k] = v
+        return stalls
+
+    def _extract_scheduler_metrics(self, action) -> Dict[str, float]:
+        """Extract scheduler eligibility/issue stats when available."""
+        sched: Dict[str, float] = {}
+        pairs = {
+            "smsp__warps_eligible.avg.per_cycle_active": "warps_eligible_per_cycle",
+            "smsp__inst_issued.avg.per_cycle_active": "inst_issued_per_cycle",
+            "smsp__issue_active.avg.pct_of_peak_sustained_active": "issue_active_pct",
+        }
+        for m, k in pairs.items():
+            v, _ = _metric_value(action, m)
+            if v is not None:
+                sched[k] = v
+        return sched
+
+    def _extract_access_pattern_metrics(self, action) -> Dict[str, float]:
+        """Access‑pattern diagnostics: coalescing, L2 over‑fetch, bank conflicts."""
+        ap: Dict[str, float] = {}
+
+        # L1 requests vs sectors (loads/stores) → coalescing score
+        req_ld, _ = _metric_value(action, "l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum")
+        sec_ld, _ = _metric_value(action, "l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum")
+        req_st, _ = _metric_value(action, "l1tex__t_requests_pipe_lsu_mem_global_op_st.sum")
+        sec_st, _ = _metric_value(action, "l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum")
+
+        ldr = _safe_div(sec_ld, req_ld)
+        strr = _safe_div(sec_st, req_st)
+        if ldr is not None:
+            ap["l1_load_sectors_per_req"] = ldr
+        if strr is not None:
+            ap["l1_store_sectors_per_req"] = strr
+
+        # L2 theoretical sectors (ideal/excessive)
+        l2_all, _   = _metric_value(action, "memory_l2_theoretical_sectors_global")
+        l2_ideal, _ = _metric_value(action, "memory_l2_theoretical_sectors_global_ideal")
+        # Try derived metric (may exist in some reports), otherwise compute difference
+        l2_excess, _ = _metric_value(action, "derived__memory_l2_theoretical_sectors_global_excessive")
+
+        if l2_all is not None:
+            ap["l2_theoretical_sectors_global"] = l2_all
+        if l2_ideal is not None:
+            ap["l2_theoretical_sectors_global_ideal"] = l2_ideal
+        if l2_excess is None and (l2_all is not None and l2_ideal is not None):
+            l2_excess = max(l2_all - l2_ideal, 0.0)
+        if l2_excess is not None:
+            ap["l2_theoretical_sectors_global_excessive"] = l2_excess
+
+        l2_excess_frac = _safe_div(l2_excess, l2_all)
+        if l2_excess_frac is not None:
+            ap["l2_excess_frac"] = l2_excess_frac
+
+        # Shared memory bank conflicts
+        bank_ld, _ = _metric_value(action, "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum")
+        bank_st, _ = _metric_value(action, "l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum")
+        if bank_ld is not None:
+            ap["shared_bank_conflicts_load_sum"] = bank_ld
+        if bank_st is not None:
+            ap["shared_bank_conflicts_store_sum"] = bank_st
+
+        return ap
+
+
+    def _extract_roofline_metrics(self, action, memory_metrics: Dict[str, float]) -> Dict[str, float]:
+        """
+        Roofline quantities: arithmetic intensity (FLOPs / DRAM bytes) and GFLOP/s if time is known.
+        We try common derived names from InstructionStats / Roofline; fall back gracefully.
+        """
+        roof: Dict[str, float] = {}
+
+        # Try to gather FLOP counts (sum of available kinds)
+        flop_names = [
+            "flop_count_sp",
+            "flop_count_hp",
+            "flop_count_dp",
+            "flop_count_tensor",
+        ]
+        total_flops = 0.0
+        found_any_flops = False
+        for fn in flop_names:
+            v, _ = _metric_value(action, fn)
+            if v is not None:
+                total_flops += float(v)
+                found_any_flops = True
+
+        if found_any_flops:
+            roof["flop_count_total"] = total_flops
+
+        # DRAM bytes moved (prefer direct sum; else reconstruct)
+        dram_sum_bytes, u_bytes = _metric_value(action, "dram__bytes.sum")
+        if dram_sum_bytes is None:
+            # reconstruct from avg per second * duration if both exist and duration unit known
+            dram_avg_Bps_raw, _ = _metric_value(action, "dram__bytes.avg.per_second")
+            dur_raw, dur_unit = _metric_value(action, "gpu__time_duration.sum")
+            dur_s = _to_seconds(dur_raw, dur_unit) if dur_raw is not None else None
+            if dram_avg_Bps_raw is not None and dur_s is not None:
+                dram_sum_bytes = float(dram_avg_Bps_raw) * float(dur_s)
+
+        if dram_sum_bytes is not None:
+            roof["dram_bytes_sum"] = float(dram_sum_bytes)
+
+        # Arithmetic intensity
+        if found_any_flops and dram_sum_bytes is not None and dram_sum_bytes > 0:
+            roof["arithmetic_intensity"] = float(total_flops) / float(dram_sum_bytes)
+
+        # GFLOP/s if we have time in seconds
+        dur_raw, dur_unit = _metric_value(action, "gpu__time_duration.sum")
+        dur_s = _to_seconds(dur_raw, dur_unit) if dur_raw is not None else None
+        if found_any_flops and dur_s is not None and dur_s > 0:
+            roof["gflops"] = (total_flops / dur_s) / 1e9
+
+        return roof
+
+    def _extract_timing_metrics(self, action) -> Dict[str, float]:
+        """Collect duration and cycles to enable normalization externally."""
+        tm: Dict[str, float] = {}
+        dur_val, dur_unit = _metric_value(action, "gpu__time_duration.sum")
+        if dur_val is not None:
+            tm["gpu_time_duration_sum"] = dur_val
+            if dur_unit:
+                tm["gpu_time_duration_unit"] = dur_unit  # keep raw unit for later normalization
+            # Add seconds if convertible
+            dur_s = _to_seconds(dur_val, dur_unit)
+            if dur_s is not None:
+                tm["gpu_time_duration_seconds"] = dur_s
+
+        cycles_val, cycles_unit = _metric_value(action, "gpc__cycles_elapsed.max")
+        if cycles_val is not None:
+            tm["gpc_cycles_elapsed_max"] = cycles_val
+            if cycles_unit:
+                tm["gpc_cycles_elapsed_unit"] = cycles_unit
+
+        return tm
+
+    # -------------------------------
     
     def get_available_metrics(self) -> List[str]:
         """
